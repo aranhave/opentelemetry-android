@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -59,6 +60,14 @@ static bool alternate_signal_stack_installed = false;
 static atomic_flag handling_signal = ATOMIC_FLAG_INIT;
 static struct otel_native_crash_snapshot crash_snapshot;
 static bool crash_snapshot_prepared = false;
+
+#ifdef OTEL_NATIVE_CRASH_TESTING
+static volatile sig_atomic_t test_previous_handler_count[SIGNAL_COUNT];
+static volatile sig_atomic_t test_previous_handler_saw_context[SIGNAL_COUNT];
+static volatile sig_atomic_t test_previous_handler_saw_mask[SIGNAL_COUNT];
+static volatile sig_atomic_t test_paused_signal = 0;
+static atomic_int test_pause_state;
+#endif
 
 static int find_signal_index(int signal_number) {
     for (int index = 0; index < SIGNAL_COUNT; index++) {
@@ -571,6 +580,13 @@ static void handle_signal(
     int saved_errno = errno;
     bool first_signal =
         !atomic_flag_test_and_set_explicit(&handling_signal, memory_order_relaxed);
+#ifdef OTEL_NATIVE_CRASH_TESTING
+    if (first_signal && test_paused_signal == signal_number) {
+        atomic_store_explicit(&test_pause_state, 1, memory_order_release);
+        while (atomic_load_explicit(&test_pause_state, memory_order_acquire) == 1) {
+        }
+    }
+#endif
     if (first_signal) {
         record_crash(signal_number, user_context);
     }
@@ -717,6 +733,237 @@ Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashJni_install
 }
 
 #ifdef OTEL_NATIVE_CRASH_TESTING
+static void test_previous_signal_handler(
+    int signal_number,
+    siginfo_t *signal_info,
+    void *user_context) {
+    int saved_errno = errno;
+    int index = find_signal_index(signal_number);
+    if (index >= 0) {
+        test_previous_handler_count[index]++;
+        if (signal_info != NULL && signal_info->si_signo == signal_number && user_context != NULL) {
+            test_previous_handler_saw_context[index] = 1;
+        }
+        sigset_t current_mask;
+        if (sigprocmask(SIG_SETMASK, NULL, &current_mask) == 0 &&
+            sigismember(&current_mask, SIGUSR1) == 1) {
+            test_previous_handler_saw_mask[index] = 1;
+        }
+    }
+    errno = saved_errno;
+}
+
+static void reset_test_observations(void) {
+    for (int index = 0; index < SIGNAL_COUNT; index++) {
+        test_previous_handler_count[index] = 0;
+        test_previous_handler_saw_context[index] = 0;
+        test_previous_handler_saw_mask[index] = 0;
+    }
+    test_paused_signal = 0;
+    atomic_store_explicit(&test_pause_state, 0, memory_order_relaxed);
+    atomic_flag_clear_explicit(&handling_signal, memory_order_relaxed);
+}
+
+static bool set_test_paths(
+    JNIEnv *environment,
+    jstring marker_path,
+    jstring snapshot_path) {
+    if (marker_path == NULL || snapshot_path == NULL) {
+        return false;
+    }
+    jsize marker_path_length = (*environment)->GetStringUTFLength(environment, marker_path);
+    jsize snapshot_path_length = (*environment)->GetStringUTFLength(environment, snapshot_path);
+    if (marker_path_length <= 0 || snapshot_path_length <= 0) {
+        return false;
+    }
+
+    const char *marker = (*environment)->GetStringUTFChars(environment, marker_path, NULL);
+    if (marker == NULL) {
+        return false;
+    }
+    const char *snapshot = (*environment)->GetStringUTFChars(environment, snapshot_path, NULL);
+    if (snapshot == NULL) {
+        (*environment)->ReleaseStringUTFChars(environment, marker_path, marker);
+        return false;
+    }
+    bool paths_ready =
+        build_crash_record_paths(
+            marker,
+            (size_t) marker_path_length,
+            crash_record_path,
+            sizeof(crash_record_path),
+            temporary_crash_record_path,
+            sizeof(temporary_crash_record_path)) &&
+        build_crash_record_paths(
+            snapshot,
+            (size_t) snapshot_path_length,
+            crash_snapshot_path,
+            sizeof(crash_snapshot_path),
+            temporary_crash_snapshot_path,
+            sizeof(temporary_crash_snapshot_path));
+    (*environment)->ReleaseStringUTFChars(environment, snapshot_path, snapshot);
+    (*environment)->ReleaseStringUTFChars(environment, marker_path, marker);
+    return paths_ready;
+}
+
+static void restore_test_signal_state(const struct sigaction *original_actions) {
+    for (int index = 0; index < SIGNAL_COUNT; index++) {
+        (void) sigaction(handled_signals[index], &original_actions[index], NULL);
+        atomic_store_explicit(&handler_active[index], false, memory_order_relaxed);
+    }
+    remove_alternate_signal_stack();
+    crash_snapshot_prepared = false;
+    reset_test_observations();
+}
+
+static bool prepare_test_signal_state(
+    JNIEnv *environment,
+    jstring marker_path,
+    jstring snapshot_path,
+    struct sigaction *original_actions) {
+    if (handlers_installed || !atomic_is_lock_free(&test_pause_state) ||
+        !set_test_paths(environment, marker_path, snapshot_path)) {
+        return false;
+    }
+    unlink(crash_record_path);
+    unlink(temporary_crash_record_path);
+    unlink(crash_snapshot_path);
+    unlink(temporary_crash_snapshot_path);
+    reset_test_observations();
+
+    struct sigaction previous;
+    memset(&previous, 0, sizeof(previous));
+    if (sigemptyset(&previous.sa_mask) != 0 ||
+        sigaddset(&previous.sa_mask, SIGUSR1) != 0) {
+        return false;
+    }
+    previous.sa_sigaction = test_previous_signal_handler;
+    previous.sa_flags = SA_RESTART | SA_SIGINFO;
+
+    int configured = 0;
+    for (; configured < SIGNAL_COUNT; configured++) {
+        if (sigaction(handled_signals[configured], NULL, &original_actions[configured]) != 0 ||
+            sigaction(handled_signals[configured], &previous, NULL) != 0) {
+            break;
+        }
+    }
+    if (configured != SIGNAL_COUNT) {
+        for (int index = 0; index < configured; index++) {
+            (void) sigaction(handled_signals[index], &original_actions[index], NULL);
+        }
+        return false;
+    }
+
+    crash_snapshot_prepared = prepare_crash_snapshot();
+    if (!install_handlers()) {
+        restore_test_signal_state(original_actions);
+        return false;
+    }
+    return true;
+}
+
+static bool test_observed_previous_handler(int signal_number) {
+    int index = find_signal_index(signal_number);
+    return index >= 0 && test_previous_handler_count[index] == 1 &&
+        test_previous_handler_saw_context[index] == 1 &&
+        test_previous_handler_saw_mask[index] == 1;
+}
+
+static void *raise_test_signal(void *argument) {
+    int signal_number = *(const int *) argument;
+    return (void *) (intptr_t) (raise(signal_number) == 0 ? 0 : 1);
+}
+
+JNIEXPORT jint JNICALL
+Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashTestJni_compiledArchitecture(
+    JNIEnv *environment,
+    jclass native_crash_test_jni) {
+    (void) environment;
+    (void) native_crash_test_jni;
+    return (jint) OTEL_NCS_ARCH_CURRENT;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashTestJni_runHandlerChainingTest(
+    JNIEnv *environment,
+    jclass native_crash_test_jni,
+    jstring marker_path,
+    jstring snapshot_path) {
+    (void) native_crash_test_jni;
+    struct sigaction original_actions[SIGNAL_COUNT];
+    if (!prepare_test_signal_state(
+            environment,
+            marker_path,
+            snapshot_path,
+            original_actions)) {
+        return JNI_FALSE;
+    }
+
+    errno = E2BIG;
+    int raise_result = raise(SIGABRT);
+    int observed_errno = errno;
+    bool passed =
+        raise_result == 0 && observed_errno == E2BIG &&
+        test_observed_previous_handler(SIGABRT) &&
+        access(crash_record_path, F_OK) == 0 &&
+        access(crash_snapshot_path, F_OK) == 0;
+    restore_test_signal_state(original_actions);
+    return passed ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashTestJni_runConcurrentSignalTest(
+    JNIEnv *environment,
+    jclass native_crash_test_jni,
+    jstring marker_path,
+    jstring snapshot_path) {
+    (void) native_crash_test_jni;
+    struct sigaction original_actions[SIGNAL_COUNT];
+    if (!prepare_test_signal_state(
+            environment,
+            marker_path,
+            snapshot_path,
+            original_actions)) {
+        return JNI_FALSE;
+    }
+
+    int first_signal = SIGABRT;
+    int second_signal = SIGSEGV;
+    pthread_t first_thread;
+    pthread_t second_thread;
+    void *first_result = (void *) (intptr_t) 1;
+    void *second_result = (void *) (intptr_t) 1;
+    bool first_started = false;
+    bool second_started = false;
+    test_paused_signal = first_signal;
+
+    if (pthread_create(&first_thread, NULL, raise_test_signal, &first_signal) == 0) {
+        first_started = true;
+        for (int attempt = 0;
+             attempt < 1000000 &&
+             atomic_load_explicit(&test_pause_state, memory_order_acquire) != 1;
+             attempt++) {
+            sched_yield();
+        }
+        if (atomic_load_explicit(&test_pause_state, memory_order_acquire) == 1 &&
+            pthread_create(&second_thread, NULL, raise_test_signal, &second_signal) == 0) {
+            second_started = true;
+            (void) pthread_join(second_thread, &second_result);
+        }
+        atomic_store_explicit(&test_pause_state, 2, memory_order_release);
+        (void) pthread_join(first_thread, &first_result);
+    }
+
+    bool passed =
+        first_started && second_started && first_result == NULL && second_result == NULL &&
+        test_observed_previous_handler(first_signal) &&
+        test_observed_previous_handler(second_signal) &&
+        access(crash_record_path, F_OK) == 0 &&
+        access(crash_snapshot_path, F_OK) == 0;
+    restore_test_signal_state(original_actions);
+    return passed ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashTestJni_writeCrashMarker(
     JNIEnv *environment,
@@ -756,6 +1003,71 @@ Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashTestJni_wri
             (uint64_t) timestamp_epoch_nanos);
 
     (*environment)->ReleaseStringUTFChars(environment, marker_path, path);
+    return written ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashTestJni_captureCrashSnapshot(
+    JNIEnv *environment,
+    jclass native_crash_test_jni,
+    jstring snapshot_path,
+    jint signal_number,
+    jlong timestamp_epoch_nanos) {
+    (void) native_crash_test_jni;
+    if (snapshot_path == NULL || signal_number <= 0 || timestamp_epoch_nanos <= 0) {
+        return JNI_FALSE;
+    }
+
+    jsize path_length = (*environment)->GetStringUTFLength(environment, snapshot_path);
+    if (path_length <= 0) {
+        return JNI_FALSE;
+    }
+    const char *path = (*environment)->GetStringUTFChars(environment, snapshot_path, NULL);
+    if (path == NULL) {
+        return JNI_FALSE;
+    }
+
+    char test_snapshot_path[PATH_MAX];
+    char test_temporary_snapshot_path[PATH_MAX];
+    struct otel_native_crash_snapshot snapshot;
+    if (!prepare_crash_snapshot_at(&snapshot)) {
+        (*environment)->ReleaseStringUTFChars(environment, snapshot_path, path);
+        return JNI_FALSE;
+    }
+    snapshot.signal_number = (uint32_t) signal_number;
+    snapshot.timestamp_epoch_nanos = (uint64_t) timestamp_epoch_nanos;
+    snapshot.program_counter = (uint64_t) (uintptr_t) __builtin_return_address(0);
+    snapshot.stack_pointer = (uint64_t) (uintptr_t) __builtin_frame_address(0);
+    snapshot.frame_pointer = snapshot.stack_pointer;
+    snapshot.link_register =
+        snapshot.architecture == OTEL_NCS_ARCH_ARM ||
+            snapshot.architecture == OTEL_NCS_ARCH_ARM64
+        ? snapshot.program_counter
+        : 0;
+    snapshot.stack_start = snapshot.stack_pointer;
+    snapshot.stack_size =
+        (uint32_t) capture_stack(snapshot.stack_pointer, snapshot.stack);
+    if (snapshot.program_counter == 0 || snapshot.stack_pointer == 0 || snapshot.stack_size == 0) {
+        (*environment)->ReleaseStringUTFChars(environment, snapshot_path, path);
+        return JNI_FALSE;
+    }
+    snapshot.checksum = snapshot_checksum(&snapshot);
+
+    bool written =
+        build_crash_record_paths(
+            path,
+            (size_t) path_length,
+            test_snapshot_path,
+            sizeof(test_snapshot_path),
+            test_temporary_snapshot_path,
+            sizeof(test_temporary_snapshot_path)) &&
+        write_atomic_file(
+            test_snapshot_path,
+            test_temporary_snapshot_path,
+            &snapshot,
+            sizeof(snapshot),
+            false);
+    (*environment)->ReleaseStringUTFChars(environment, snapshot_path, path);
     return written ? JNI_TRUE : JNI_FALSE;
 }
 #endif

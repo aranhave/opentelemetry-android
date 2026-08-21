@@ -8,6 +8,10 @@ description = "OpenTelemetry Android native crash instrumentation"
 android {
     namespace = "io.opentelemetry.android.instrumentation.nativecrash"
 
+    compileOptions {
+        isCoreLibraryDesugaringEnabled = true
+    }
+
     defaultConfig {
         consumerProguardFiles("consumer-rules.pro")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -32,6 +36,7 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring(libs.desugarJdkLibs)
     api(platform(libs.opentelemetry.platform.alpha)) // Required for sonatype publishing
     implementation(project(":agent-api"))
     implementation(project(":common"))
