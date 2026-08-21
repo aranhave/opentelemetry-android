@@ -162,7 +162,7 @@ class NativeCrashReporterTest {
     fun `does not replace crash context or install handlers while recovery is pending`() {
         val store = mockk<NativeCrashStore>(relaxed = true)
         val savedContext = crashContext("crashed")
-        every { store.recordRecoveryFailure(false) } returns true
+        every { store.recordRecoveryFailure() } returns true
         every { store.recoveryAttemptsExhausted() } returns false
         every { store.readContext() } returns savedContext
         every { store.readCrashRecord() } returns NativeCrashReadResult.RetryableFailure
