@@ -12,7 +12,6 @@ internal enum class NativeCrashFrameSource {
     PROGRAM_COUNTER,
     FRAME_POINTER,
     LINK_REGISTER,
-    STACK_SCAN,
 }
 
 internal data class NativeCrashStackFrame(
@@ -24,7 +23,6 @@ internal data class NativeCrashStackFrame(
 
 internal class NativeCrashStackTrace(
     val frames: List<NativeCrashStackFrame>,
-    val scanCandidates: List<NativeCrashStackFrame>,
     private val pointerSize: Int,
 ) {
     override fun toString(): String =
@@ -51,15 +49,11 @@ internal object NativeCrashStackUnwinder {
             } else {
                 0
             }
-        if (recoveredFrames == 0) {
-            if (snapshot.architecture.hasLinkRegister) {
-                collector.addConfirmed(snapshot.linkRegister, NativeCrashFrameSource.LINK_REGISTER)
-            }
-            scanStack(stack, collector)
+        if (recoveredFrames == 0 && snapshot.architecture.hasLinkRegister) {
+            collector.addConfirmed(snapshot.linkRegister, NativeCrashFrameSource.LINK_REGISTER)
         }
         return NativeCrashStackTrace(
             frames = collector.frames,
-            scanCandidates = collector.scanCandidates,
             pointerSize = snapshot.architecture.pointerSize,
         )
     }
@@ -84,25 +78,11 @@ internal object NativeCrashStackUnwinder {
         return recoveredFrames
     }
 
-    private fun scanStack(
-        stack: CapturedStack,
-        collector: FrameCollector,
-    ) {
-        var offset = 0
-        while (offset + stack.pointerSize <= stack.size) {
-            collector.addScanCandidate(stack.readPointerAtOffset(offset))
-            offset += stack.pointerSize
-        }
-    }
-
     private class FrameCollector(
         private val architecture: NativeCrashArchitecture,
         private val modules: List<NativeCrashModule>,
     ) {
         val frames = ArrayList<NativeCrashStackFrame>()
-        val scanCandidates = ArrayList<NativeCrashStackFrame>()
-        private val confirmedAddresses = HashSet<ULong>()
-        private val candidateAddresses = HashSet<ULong>()
         val isFull: Boolean
             get() = frames.size >= MAX_FRAMES
 
@@ -113,15 +93,7 @@ internal object NativeCrashStackUnwinder {
             if (address == 0UL || isFull) return false
             val resolved = resolve(address) ?: return false
             frames += resolved.toFrame(source)
-            confirmedAddresses += resolved.address
             return true
-        }
-
-        fun addScanCandidate(address: ULong) {
-            if (address == 0UL || scanCandidates.size >= MAX_FRAMES) return
-            val resolved = resolve(address) ?: return
-            if (resolved.address in confirmedAddresses || !candidateAddresses.add(resolved.address)) return
-            scanCandidates += resolved.toFrame(NativeCrashFrameSource.STACK_SCAN)
         }
 
         private fun resolve(address: ULong): ResolvedAddress? {
@@ -151,9 +123,6 @@ internal object NativeCrashStackUnwinder {
         private val bytes: ByteArray,
         val pointerSize: Int,
     ) {
-        val size: Int
-            get() = bytes.size
-
         fun contains(address: ULong): Boolean =
             bytes.size >= pointerSize &&
                 address >= start &&

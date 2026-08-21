@@ -49,13 +49,12 @@ class NativeCrashStackUnwinderTest {
     }
 
     @Test
-    fun `keeps scan hits separate and deduplicated`() {
+    fun `uses the normalized arm link register when no frame pointer caller is available`() {
         val trace =
             NativeCrashStackUnwinder.unwind(
                 snapshot(
                     architecture = NativeCrashArchitecture.ARM,
                     linkRegister = 0x1301UL,
-                    stack = stack(4, 0x1301UL, 0x1501UL, 0x1501UL, 0x9999UL),
                 ),
             )
 
@@ -64,9 +63,6 @@ class NativeCrashStackUnwinderTest {
                 frame(0x120UL, NativeCrashFrameSource.PROGRAM_COUNTER),
                 frame(0x300UL, NativeCrashFrameSource.LINK_REGISTER),
             )
-        assertThat(trace.scanCandidates)
-            .containsExactly(frame(0x500UL, NativeCrashFrameSource.STACK_SCAN))
-        assertThat(trace.toString()).doesNotContain("00000500")
     }
 
     @Test
@@ -84,7 +80,6 @@ class NativeCrashStackUnwinderTest {
         val trace = NativeCrashStackUnwinder.unwind(snapshot(modules = emptyList()))
 
         assertThat(trace.frames).isEmpty()
-        assertThat(trace.scanCandidates).isEmpty()
         assertThat(trace.toString()).isEmpty()
     }
 
