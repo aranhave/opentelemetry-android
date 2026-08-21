@@ -130,7 +130,7 @@ internal object NativeCrashSnapshotParser {
         val moduleCount = buffer.getInt(NativeCrashSnapshotLayout.MODULE_COUNT_OFFSET)
         val stackSize = buffer.getInt(NativeCrashSnapshotLayout.STACK_SIZE_OFFSET)
 
-        if (programCounter == 0UL || stackPointer == 0UL || stackStart != stackPointer) return null
+        if (stackPointer == 0UL || stackStart != stackPointer) return null
         if (stackStart % architecture.pointerSize.toULong() != 0UL) return null
         if (moduleCount !in 1..NativeCrashSnapshotLayout.MAX_MODULES) return null
         if (stackSize !in 0..NativeCrashSnapshotLayout.STACK_CAPACITY) return null

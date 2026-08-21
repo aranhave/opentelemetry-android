@@ -73,6 +73,26 @@ class NativeCrashSnapshotParserTest {
         assertThat(snapshot.modules.single().executableEnd).isEqualTo(0xf000_2000UL)
     }
 
+    @Test
+    fun `accepts zero program counter when the stack is usable`() {
+        val snapshot =
+            NativeCrashSnapshotParser.parse(
+                SnapshotBuilder()
+                    .addresses(
+                        programCounter = 0UL,
+                        stackPointer = STACK_START.toULong(),
+                        framePointer = STACK_START.toULong(),
+                        moduleLoadBias = 0x1000UL,
+                        moduleStart = 0x1100UL,
+                        moduleEnd = 0x2000UL,
+                    ).build(),
+                crashRecord,
+            )
+
+        assertThat(snapshot).isNotNull()
+        assertThat(snapshot!!.programCounter).isEqualTo(0UL)
+    }
+
     @TestFactory
     fun `rejects structurally invalid snapshots`() =
         listOf<Pair<String, (ByteBuffer) -> Unit>>(
@@ -80,7 +100,6 @@ class NativeCrashSnapshotParserTest {
             "version" to { buffer -> buffer.putInt(NativeCrashSnapshotLayout.VERSION_OFFSET, 2) },
             "architecture" to { buffer -> buffer.putInt(NativeCrashSnapshotLayout.ARCHITECTURE_OFFSET, 99) },
             "record size" to { buffer -> buffer.putInt(NativeCrashSnapshotLayout.RECORD_SIZE_OFFSET, 1) },
-            "program counter" to { buffer -> buffer.putLong(NativeCrashSnapshotLayout.PROGRAM_COUNTER_OFFSET, 0) },
             "stack pointer" to { buffer -> buffer.putLong(NativeCrashSnapshotLayout.STACK_POINTER_OFFSET, 0) },
             "stack start" to { buffer -> buffer.putLong(NativeCrashSnapshotLayout.STACK_START_OFFSET, STACK_START + 8) },
             "stack alignment" to { buffer ->
