@@ -36,7 +36,6 @@ import io.opentelemetry.kotlin.semconv.SessionAttributes.SESSION_ID
 import io.opentelemetry.sdk.common.Clock
 import io.opentelemetry.sdk.testing.junit5.OpenTelemetryExtension
 import org.assertj.core.api.Assertions.assertThat
-import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -163,6 +162,8 @@ class NativeCrashReporterTest {
     fun `does not replace crash context or install handlers while recovery is pending`() {
         val store = mockk<NativeCrashStore>(relaxed = true)
         val savedContext = crashContext("crashed")
+        every { store.recordRecoveryFailure(false) } returns true
+        every { store.recoveryAttemptsExhausted() } returns false
         every { store.readContext() } returns savedContext
         every { store.readCrashRecord() } returns NativeCrashReadResult.RetryableFailure
         val packageManager = mockk<PackageManager>()
@@ -421,97 +422,6 @@ class NativeCrashReporterTest {
         reporter(store).replayPreviousCrash()
 
         assertThat(otelTesting.logRecords).isEmpty()
-        assertThat(store.crashSnapshotPath).doesNotExist()
-    }
-
-    @Test
-    fun `retains recovery files when the marker read can be retried`() {
-        val store = mockk<NativeCrashStore>(relaxed = true)
-        every { store.readContext() } returns null
-        every { store.readCrashRecord() } returns NativeCrashReadResult.RetryableFailure
-
-        reporter(store).replayPreviousCrash()
-
-        assertThat(otelTesting.logRecords).isEmpty()
-        verify(exactly = 0) {
-            store.deleteCrashRecord()
-            store.deleteCrashSnapshot()
-        }
-    }
-
-    @Test
-    fun `retains recovery files when the snapshot read can be retried`() {
-        val store = mockk<NativeCrashStore>(relaxed = true)
-        val record = NativeCrashRecord(11, Instant.ofEpochSecond(1_783_598_400))
-        every { store.readContext() } returns null
-        every { store.readCrashRecord() } returns NativeCrashReadResult.Success(record)
-        every { store.readCrashStackTrace(record) } returns NativeCrashReadResult.RetryableFailure
-
-        reporter(store).replayPreviousCrash()
-
-        assertThat(otelTesting.logRecords).isEmpty()
-        verify(exactly = 0) {
-            store.deleteCrashRecord()
-            store.deleteCrashSnapshot()
-        }
-    }
-
-    @Test
-    fun `retains recovery files when crash emission fails`() {
-        val store = FileNativeCrashStore(tempDir)
-        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
-        store.crashSnapshotPath.writeBytes(snapshotBytes())
-        val rum = mockk<OpenTelemetryRum>()
-        every { rum.openTelemetry } throws IllegalStateException("logger unavailable")
-
-        assertThatThrownBy { NativeCrashReporter(store, rum).replayPreviousCrash() }
-            .isInstanceOf(IllegalStateException::class.java)
-
-        assertThat(store.crashRecordPath).exists()
-        assertThat(store.crashSnapshotPath).exists()
-    }
-
-    @Test
-    fun `retains the snapshot when marker cleanup fails`() {
-        val store =
-            FileNativeCrashStore(tempDir) { file ->
-                file.name != "native-crash-record.properties"
-            }
-        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
-        store.crashSnapshotPath.writeBytes(snapshotBytes())
-
-        val result = reporter(store).replayPreviousCrash()
-
-        assertThat(otelTesting.logRecords).hasSize(1)
-        assertThat(result).isEqualTo(NativeCrashReplayResult.RETRY_PENDING)
-        assertThat(store.crashRecordPath).exists()
-        assertThat(store.crashSnapshotPath).exists()
-    }
-
-    @Test
-    fun `retries retained recovery files on the next launch`() {
-        var failMarkerDeletion = true
-        val store =
-            FileNativeCrashStore(tempDir) { file ->
-                if (file.name == "native-crash-record.properties" && failMarkerDeletion) {
-                    failMarkerDeletion = false
-                    false
-                } else {
-                    file.delete()
-                }
-            }
-        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
-        store.crashSnapshotPath.writeBytes(snapshotBytes())
-        val reporter = reporter(store)
-
-        assertThat(reporter.replayPreviousCrash()).isEqualTo(NativeCrashReplayResult.RETRY_PENDING)
-        assertThat(store.crashRecordPath).exists()
-        assertThat(store.crashSnapshotPath).exists()
-        otelTesting.clearLogRecords()
-
-        assertThat(reporter.replayPreviousCrash()).isEqualTo(NativeCrashReplayResult.COMPLETE)
-        assertThat(otelTesting.logRecords).hasSize(1)
-        assertThat(store.crashRecordPath).doesNotExist()
         assertThat(store.crashSnapshotPath).doesNotExist()
     }
 

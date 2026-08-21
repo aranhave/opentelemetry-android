@@ -55,36 +55,51 @@ class NativeCrashInstrumentation internal constructor(
     ) {
         val applicationContext = context.applicationContext
         executor.execute {
-            val store = storeFactory(applicationContext)
-            val crashContext = applicationContext.currentCrashContext(openTelemetryRum)
-            val replayResult =
-                NativeCrashReporter(
-                    store = store,
-                    openTelemetryRum = openTelemetryRum,
-                ).replayPreviousCrash()
-            if (replayResult == NativeCrashReplayResult.RETRY_PENDING) {
+            try {
+                installAfterRecovery(applicationContext, openTelemetryRum)
+            } catch (error: Exception) {
                 Log.w(
                     RumConstants.OTEL_RUM_LOG_TAG,
-                    "Native crash signal handler disabled while previous crash recovery is pending",
+                    "Failed to initialize native crash instrumentation",
+                    error,
                 )
-                return@execute
             }
-            if (!store.writeContext(crashContext)) {
-                Log.w(
-                    RumConstants.OTEL_RUM_LOG_TAG,
-                    "Native crash signal handler disabled because crash context could not be persisted",
-                )
-                return@execute
-            }
+        }
+    }
 
-            val sessionProvider = openTelemetryRum.sessionProvider
-            if (sessionProvider is SessionPublisher) {
-                sessionProvider.addObserver(NativeCrashSessionObserver(store, crashContext, executor))
-            }
+    private fun installAfterRecovery(
+        applicationContext: Context,
+        openTelemetryRum: OpenTelemetryRum,
+    ) {
+        val store = storeFactory(applicationContext)
+        val crashContext = applicationContext.currentCrashContext(openTelemetryRum)
+        val replayResult =
+            NativeCrashReporter(
+                store = store,
+                openTelemetryRum = openTelemetryRum,
+            ).replayPreviousCrash()
+        if (replayResult == NativeCrashReplayResult.RETRY_PENDING) {
+            Log.w(
+                RumConstants.OTEL_RUM_LOG_TAG,
+                "Native crash signal handler disabled while previous crash recovery is pending",
+            )
+            return
+        }
+        if (!store.writeContext(crashContext)) {
+            Log.w(
+                RumConstants.OTEL_RUM_LOG_TAG,
+                "Native crash signal handler disabled because crash context could not be persisted",
+            )
+            return
+        }
 
-            if (!signalHandlerInstaller.install(store.crashRecordPath)) {
-                Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to install native crash signal handler")
-            }
+        val sessionProvider = openTelemetryRum.sessionProvider
+        if (sessionProvider is SessionPublisher) {
+            sessionProvider.addObserver(NativeCrashSessionObserver(store, crashContext, executor))
+        }
+
+        if (!signalHandlerInstaller.install(store.crashRecordPath)) {
+            Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to install native crash signal handler")
         }
     }
 }
@@ -145,11 +160,28 @@ internal class NativeCrashReporter(
     private val openTelemetryRum: OpenTelemetryRum,
 ) {
     fun replayPreviousCrash(): NativeCrashReplayResult {
+        if (store.recoveryAttemptsExhausted()) {
+            store.deleteCrashRecord()
+            return NativeCrashReplayResult.COMPLETE
+        }
+        if (store.recoveryEventWasEmitted()) {
+            return cleanupDeliveredCrash()
+        }
+        return try {
+            replayPreviousCrashOrThrow()
+        } catch (error: Exception) {
+            Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to replay native crash", error)
+            retryOrAbandon(eventEmitted = false)
+        }
+    }
+
+    private fun replayPreviousCrashOrThrow(): NativeCrashReplayResult {
         val crashContext = store.readContext()
         val record =
             when (val result = store.readCrashRecord()) {
                 NativeCrashReadResult.Missing -> {
                     store.deleteCrashSnapshot()
+                    store.clearRecoveryAttempts()
                     return NativeCrashReplayResult.COMPLETE
                 }
 
@@ -157,12 +189,12 @@ internal class NativeCrashReporter(
                     return if (store.deleteCrashRecord()) {
                         NativeCrashReplayResult.COMPLETE
                     } else {
-                        NativeCrashReplayResult.RETRY_PENDING
+                        retryOrAbandon(eventEmitted = false)
                     }
                 }
 
                 NativeCrashReadResult.RetryableFailure -> {
-                    return NativeCrashReplayResult.RETRY_PENDING
+                    return retryOrAbandon(eventEmitted = false)
                 }
 
                 is NativeCrashReadResult.Success -> {
@@ -181,7 +213,7 @@ internal class NativeCrashReporter(
                 }
 
                 NativeCrashReadResult.RetryableFailure -> {
-                    return NativeCrashReplayResult.RETRY_PENDING
+                    return retryOrAbandon(eventEmitted = false)
                 }
 
                 is NativeCrashReadResult.Success -> {
@@ -189,6 +221,22 @@ internal class NativeCrashReporter(
                 }
             }
         return replay(record, crashContext, stackTrace)
+    }
+
+    private fun cleanupDeliveredCrash(): NativeCrashReplayResult =
+        if (store.deleteCrashRecord()) {
+            NativeCrashReplayResult.COMPLETE
+        } else {
+            retryOrAbandon(eventEmitted = true)
+        }
+
+    private fun retryOrAbandon(eventEmitted: Boolean): NativeCrashReplayResult {
+        val retryRecorded = store.recordRecoveryFailure(eventEmitted)
+        if (retryRecorded && !store.recoveryAttemptsExhausted()) {
+            return NativeCrashReplayResult.RETRY_PENDING
+        }
+        store.deleteCrashRecord()
+        return NativeCrashReplayResult.COMPLETE
     }
 
     private fun replay(
@@ -218,7 +266,7 @@ internal class NativeCrashReporter(
         return if (store.deleteCrashRecord()) {
             NativeCrashReplayResult.COMPLETE
         } else {
-            NativeCrashReplayResult.RETRY_PENDING
+            retryOrAbandon(eventEmitted = true)
         }
     }
 }
@@ -239,6 +287,14 @@ internal interface NativeCrashStore {
     fun deleteCrashRecord(): Boolean
 
     fun deleteCrashSnapshot(): Boolean
+
+    fun recordRecoveryFailure(eventEmitted: Boolean): Boolean
+
+    fun recoveryAttemptsExhausted(): Boolean
+
+    fun recoveryEventWasEmitted(): Boolean
+
+    fun clearRecoveryAttempts()
 
     fun readContext(): NativeCrashContext?
 
@@ -262,6 +318,7 @@ internal class FileNativeCrashStore(
     private val fileDeleter: (File) -> Boolean = File::delete,
 ) : NativeCrashStore {
     private val contextPath = File(directory, "native-crash-context.properties")
+    private val recoveryAttemptsPath = File(directory, "native-crash-recovery-attempts.properties")
     override val crashRecordPath = File(directory, "native-crash-record.properties")
     override val crashSnapshotPath = File(directory, "native-crash-snapshot.bin")
 
@@ -289,6 +346,7 @@ internal class FileNativeCrashStore(
         val markerDeleted = deleteFile(crashRecordPath, "marker")
         if (markerDeleted) {
             deleteCrashSnapshot()
+            clearRecoveryAttempts()
         }
         return markerDeleted
     }
@@ -317,6 +375,45 @@ internal class FileNativeCrashStore(
 
     override fun deleteCrashSnapshot(): Boolean = deleteFile(crashSnapshotPath, "snapshot")
 
+    @Synchronized
+    override fun recordRecoveryFailure(eventEmitted: Boolean): Boolean {
+        val markerIdentity = crashRecordPath.identity() ?: return false
+        val previousState = readRecoveryAttemptState()?.takeIf { it.markerIdentity == markerIdentity }
+        val nextState =
+            RecoveryAttemptState(
+                markerIdentity = markerIdentity,
+                attempts = (previousState?.attempts ?: 0) + 1,
+                eventEmitted = previousState?.eventEmitted == true || eventEmitted,
+            )
+        return writePropertiesAtomically(recoveryAttemptsPath, nextState.toProperties()).also { persisted ->
+            if (!persisted) {
+                Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to persist native crash recovery attempt")
+            }
+        }
+    }
+
+    @Synchronized
+    override fun recoveryAttemptsExhausted(): Boolean {
+        val markerIdentity = crashRecordPath.identity() ?: return false
+        val state = readRecoveryAttemptState() ?: return false
+        return state.markerIdentity == markerIdentity && state.attempts >= MAX_RECOVERY_ATTEMPTS
+    }
+
+    @Synchronized
+    override fun recoveryEventWasEmitted(): Boolean {
+        val markerIdentity = crashRecordPath.identity() ?: return false
+        val state = readRecoveryAttemptState() ?: return false
+        return state.markerIdentity == markerIdentity && state.eventEmitted
+    }
+
+    @Synchronized
+    override fun clearRecoveryAttempts() {
+        runCatching { recoveryAttemptsPath.delete() }
+            .onFailure { error ->
+                Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to clear native crash recovery attempts", error)
+            }
+    }
+
     override fun readContext(): NativeCrashContext? {
         val properties = runCatching { contextPath.readProperties() }.getOrNull() ?: return null
         return properties.toCrashContextOrNull()
@@ -324,27 +421,40 @@ internal class FileNativeCrashStore(
 
     @Synchronized
     override fun writeContext(context: NativeCrashContext): Boolean =
+        Properties()
+            .apply {
+                setIfNotNull(SESSION_ID, context.sessionId)
+                setIfNotNull(SERVICE_VERSION, context.serviceVersion)
+                setIfNotNull(OS_NAME, context.osName)
+                setIfNotNull(OS_VERSION, context.osVersion)
+            }.let { writePropertiesAtomically(contextPath, it) }
+
+    private fun readRecoveryAttemptState(): RecoveryAttemptState? =
+        runCatching { recoveryAttemptsPath.readProperties().toRecoveryAttemptStateOrNull() }
+            .onFailure { error ->
+                Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to read native crash recovery attempts", error)
+            }.getOrNull()
+
+    private fun writePropertiesAtomically(
+        path: File,
+        properties: Properties,
+    ): Boolean =
         runCatching {
             directory.mkdirs()
-            val properties = Properties()
-            properties.setIfNotNull(SESSION_ID, context.sessionId)
-            properties.setIfNotNull(SERVICE_VERSION, context.serviceVersion)
-            properties.setIfNotNull(OS_NAME, context.osName)
-            properties.setIfNotNull(OS_VERSION, context.osVersion)
-            val temporaryPath = File(directory, "${contextPath.name}.tmp")
+            val temporaryPath = File(directory, "${path.name}.tmp")
             try {
                 FileOutputStream(temporaryPath).use { properties.store(it, null) }
                 val replaced =
-                    temporaryPath.renameTo(contextPath) ||
-                        (contextPath.isFile && contextPath.delete() && temporaryPath.renameTo(contextPath))
+                    temporaryPath.renameTo(path) ||
+                        (path.isFile && path.delete() && temporaryPath.renameTo(path))
                 if (!replaced) {
-                    throw IOException("Failed to replace native crash context")
+                    throw IOException("Failed to replace ${path.name}")
                 }
             } finally {
                 temporaryPath.delete()
             }
         }.onFailure { error ->
-            Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to persist native crash context", error)
+            Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to persist ${path.name}", error)
         }.isSuccess
 
     private fun Properties.toCrashRecordOrNull(): NativeCrashRecord? {
@@ -378,6 +488,20 @@ internal class FileNativeCrashStore(
         return context.takeUnless { it.isEmpty() }
     }
 
+    private fun Properties.toRecoveryAttemptStateOrNull(): RecoveryAttemptState? {
+        val markerIdentity = getProperty(RECOVERY_MARKER_IDENTITY_KEY)?.takeIf { it.isNotBlank() } ?: return null
+        val attempts = getProperty(RECOVERY_ATTEMPTS_KEY)?.toIntOrNull()?.takeIf { it > 0 } ?: return null
+        val eventEmitted = getProperty(RECOVERY_EVENT_EMITTED_KEY)?.toBooleanStrictOrNull() ?: false
+        return RecoveryAttemptState(markerIdentity, attempts, eventEmitted)
+    }
+
+    private fun RecoveryAttemptState.toProperties(): Properties =
+        Properties().apply {
+            setProperty(RECOVERY_MARKER_IDENTITY_KEY, markerIdentity)
+            setProperty(RECOVERY_ATTEMPTS_KEY, attempts.toString())
+            setProperty(RECOVERY_EVENT_EMITTED_KEY, eventEmitted.toString())
+        }
+
     private fun deleteFile(
         path: File,
         description: String,
@@ -394,8 +518,18 @@ internal class FileNativeCrashStore(
     private companion object {
         const val SIGNAL_NUMBER_KEY = "signal.number"
         const val TIMESTAMP_EPOCH_NANOS_KEY = "timestamp.epoch_nanos"
+        const val RECOVERY_MARKER_IDENTITY_KEY = "marker.identity"
+        const val RECOVERY_ATTEMPTS_KEY = "attempts"
+        const val RECOVERY_EVENT_EMITTED_KEY = "event.emitted"
+        const val MAX_RECOVERY_ATTEMPTS = 3
     }
 }
+
+private data class RecoveryAttemptState(
+    val markerIdentity: String,
+    val attempts: Int,
+    val eventEmitted: Boolean,
+)
 
 internal data class NativeCrashRecord(
     val signalNumber: Int,
@@ -464,6 +598,8 @@ private fun File.readProperties(): Properties =
     Properties().also { properties ->
         FileInputStream(this).use { properties.load(it) }
     }
+
+private fun File.identity(): String? = takeIf(File::isFile)?.let { "${it.lastModified()}:${it.length()}" }
 
 private fun File.readExactBytes(expectedSize: Int): ByteArray? =
     FileInputStream(this).use { input ->
