@@ -4,9 +4,12 @@
  */
 
 #include <errno.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <link.h>
 #include <limits.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,6 +18,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/ucontext.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -43,6 +48,8 @@ static const int handled_signals[SIGNAL_COUNT] = {
 
 static char crash_record_path[PATH_MAX];
 static char temporary_crash_record_path[PATH_MAX];
+static char crash_snapshot_path[PATH_MAX];
+static char temporary_crash_snapshot_path[PATH_MAX];
 static struct sigaction previous_actions[SIGNAL_COUNT];
 static atomic_bool handler_active[SIGNAL_COUNT];
 static unsigned char alternate_signal_stack[ALTERNATE_STACK_SIZE];
@@ -50,6 +57,8 @@ static pthread_mutex_t install_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool handlers_installed = false;
 static bool alternate_signal_stack_installed = false;
 static atomic_flag handling_signal = ATOMIC_FLAG_INIT;
+static struct otel_native_crash_snapshot crash_snapshot;
+static bool crash_snapshot_prepared = false;
 
 static int find_signal_index(int signal_number) {
     for (int index = 0; index < SIGNAL_COUNT; index++) {
@@ -111,6 +120,288 @@ static bool write_all(int file_descriptor, const char *buffer, size_t length) {
     return true;
 }
 
+static bool write_atomic_file(
+    const char *path,
+    const char *temporary_path,
+    const void *bytes,
+    size_t length,
+    bool sync_file) {
+    int file_descriptor = open(temporary_path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+    if (file_descriptor < 0) {
+        return false;
+    }
+
+    bool complete = write_all(file_descriptor, (const char *) bytes, length);
+    if (complete && sync_file) {
+        complete = fsync(file_descriptor) == 0;
+    }
+    if (close(file_descriptor) != 0) {
+        complete = false;
+    }
+    if (!complete || rename(temporary_path, path) != 0) {
+        unlink(temporary_path);
+        return false;
+    }
+    return true;
+}
+
+static void copy_module_name(char *destination, const char *source) {
+    static const char main_module_name[] = "<main>";
+    if (source == NULL || source[0] == '\0') {
+        source = main_module_name;
+    } else {
+        const char *basename = source;
+        for (const char *cursor = source; *cursor != '\0'; cursor++) {
+            if (*cursor == '/') {
+                basename = cursor + 1;
+            }
+        }
+        if (*basename != '\0') {
+            source = basename;
+        }
+    }
+
+    size_t index = 0;
+    while (index + 1 < OTEL_NCS_MODULE_NAME_SIZE && source[index] != '\0') {
+        unsigned char byte = (unsigned char) source[index];
+        destination[index] = byte >= 0x20 && byte <= 0x7e ? (char) byte : '_';
+        index++;
+    }
+    destination[index] = '\0';
+}
+
+static bool checked_note_size(uint32_t value, size_t *aligned) {
+    if ((size_t) value > SIZE_MAX - 3) {
+        return false;
+    }
+    *aligned = ((size_t) value + 3) & ~(size_t) 3;
+    return true;
+}
+
+static void copy_build_id(
+    const struct dl_phdr_info *info,
+    struct otel_native_crash_module *module) {
+    uint64_t load_bias = (uint64_t) info->dlpi_addr;
+    for (ElfW(Half) index = 0; index < info->dlpi_phnum; index++) {
+        const ElfW(Phdr) *header = &info->dlpi_phdr[index];
+        if (header->p_type != PT_NOTE || header->p_memsz < sizeof(ElfW(Nhdr))) {
+            continue;
+        }
+        uint64_t virtual_address = (uint64_t) header->p_vaddr;
+        uint64_t segment_size = (uint64_t) header->p_memsz;
+        if (load_bias > UINT64_MAX - virtual_address ||
+            load_bias + virtual_address > (uint64_t) UINTPTR_MAX ||
+            segment_size > (uint64_t) SIZE_MAX) {
+            continue;
+        }
+
+        const unsigned char *cursor =
+            (const unsigned char *) (uintptr_t) (load_bias + virtual_address);
+        size_t remaining = (size_t) segment_size;
+        while (remaining >= sizeof(ElfW(Nhdr))) {
+            ElfW(Nhdr) note;
+            memcpy(&note, cursor, sizeof(note));
+            size_t name_size;
+            size_t description_size;
+            if (!checked_note_size(note.n_namesz, &name_size) ||
+                !checked_note_size(note.n_descsz, &description_size) ||
+                name_size > remaining - sizeof(note) ||
+                description_size > remaining - sizeof(note) - name_size) {
+                break;
+            }
+            const unsigned char *name = cursor + sizeof(note);
+            const unsigned char *description = name + name_size;
+            if (note.n_type == NT_GNU_BUILD_ID && note.n_namesz == 4 &&
+                memcmp(name, "GNU", 4) == 0 && note.n_descsz > 0 &&
+                note.n_descsz <= OTEL_NCS_BUILD_ID_SIZE) {
+                module->build_id_size = note.n_descsz;
+                memcpy(module->build_id, description, note.n_descsz);
+                return;
+            }
+            size_t consumed = sizeof(note) + name_size + description_size;
+            cursor += consumed;
+            remaining -= consumed;
+        }
+    }
+}
+
+static bool path_starts_with(const char *path, const char *prefix) {
+    while (*prefix != '\0') {
+        if (*path++ != *prefix++) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_app_owned_module(const char *path) {
+    if (path == NULL || path[0] == '\0') {
+        return true;
+    }
+    return path_starts_with(path, "/data/app/") ||
+        path_starts_with(path, "/data/data/") ||
+        path_starts_with(path, "/data/user/") ||
+        path_starts_with(path, "/mnt/expand/") || strstr(path, "!/lib/") != NULL;
+}
+
+struct module_collection {
+    struct otel_native_crash_snapshot *snapshot;
+    bool app_owned;
+};
+
+static int collect_executable_module(
+    struct dl_phdr_info *info,
+    size_t info_size,
+    void *data) {
+    (void) info_size;
+    struct module_collection *collection = (struct module_collection *) data;
+    if (is_app_owned_module(info->dlpi_name) != collection->app_owned) {
+        return 0;
+    }
+    struct otel_native_crash_snapshot *snapshot = collection->snapshot;
+    uint64_t load_bias = (uint64_t) info->dlpi_addr;
+    for (ElfW(Half) index = 0; index < info->dlpi_phnum; index++) {
+        const ElfW(Phdr) *header = &info->dlpi_phdr[index];
+        if (header->p_type != PT_LOAD || (header->p_flags & PF_X) == 0) {
+            continue;
+        }
+        if (snapshot->module_count >= OTEL_NCS_MAX_MODULES) {
+            return 1;
+        }
+        uint64_t virtual_address = (uint64_t) header->p_vaddr;
+        uint64_t memory_size = (uint64_t) header->p_memsz;
+        if (memory_size == 0) {
+            continue;
+        }
+        if (load_bias > UINT64_MAX - virtual_address ||
+            load_bias + virtual_address > UINT64_MAX - memory_size) {
+            continue;
+        }
+        uint64_t segment_start = load_bias + virtual_address;
+        uint64_t segment_end = segment_start + memory_size;
+        struct otel_native_crash_module *module = &snapshot->modules[snapshot->module_count++];
+        module->load_bias = load_bias;
+        module->executable_start = segment_start;
+        module->executable_end = segment_end;
+        copy_module_name(module->name, info->dlpi_name);
+        copy_build_id(info, module);
+    }
+    return 0;
+}
+
+static bool prepare_crash_snapshot_at(struct otel_native_crash_snapshot *snapshot) {
+    static const unsigned char magic[OTEL_NCS_MAGIC_SIZE] = OTEL_NCS_MAGIC;
+    memset(snapshot, 0, sizeof(*snapshot));
+    memcpy(snapshot->magic, magic, sizeof(magic));
+    snapshot->version = OTEL_NCS_VERSION;
+    snapshot->architecture = OTEL_NCS_ARCH_CURRENT;
+    snapshot->record_size = (uint32_t) sizeof(*snapshot);
+    if (snapshot->architecture == 0) {
+        return false;
+    }
+    struct module_collection collection = {
+        .snapshot = snapshot,
+        .app_owned = true,
+    };
+    dl_iterate_phdr(collect_executable_module, &collection);
+    if (snapshot->module_count < OTEL_NCS_MAX_MODULES) {
+        collection.app_owned = false;
+        dl_iterate_phdr(collect_executable_module, &collection);
+    }
+    return snapshot->module_count > 0;
+}
+
+static bool prepare_crash_snapshot(void) {
+    return prepare_crash_snapshot_at(&crash_snapshot);
+}
+
+static bool capture_registers(
+    void *user_context,
+    struct otel_native_crash_snapshot *snapshot) {
+    if (user_context == NULL) {
+        return false;
+    }
+    const ucontext_t *context = (const ucontext_t *) user_context;
+#if defined(__arm__)
+    snapshot->program_counter = (uint64_t) (uint32_t) context->uc_mcontext.arm_pc;
+    snapshot->stack_pointer = (uint64_t) (uint32_t) context->uc_mcontext.arm_sp;
+    snapshot->frame_pointer = (uint64_t) (uint32_t) context->uc_mcontext.arm_fp;
+    snapshot->link_register = (uint64_t) (uint32_t) context->uc_mcontext.arm_lr;
+#elif defined(__aarch64__)
+    snapshot->program_counter = (uint64_t) context->uc_mcontext.pc;
+    snapshot->stack_pointer = (uint64_t) context->uc_mcontext.sp;
+    snapshot->frame_pointer = (uint64_t) context->uc_mcontext.regs[29];
+    snapshot->link_register = (uint64_t) context->uc_mcontext.regs[30];
+#elif defined(__i386__)
+    snapshot->program_counter = (uint64_t) (uint32_t) context->uc_mcontext.gregs[REG_EIP];
+    snapshot->stack_pointer = (uint64_t) (uint32_t) context->uc_mcontext.gregs[REG_ESP];
+    snapshot->frame_pointer = (uint64_t) (uint32_t) context->uc_mcontext.gregs[REG_EBP];
+    snapshot->link_register = 0;
+#elif defined(__x86_64__)
+    snapshot->program_counter = (uint64_t) context->uc_mcontext.gregs[REG_RIP];
+    snapshot->stack_pointer = (uint64_t) context->uc_mcontext.gregs[REG_RSP];
+    snapshot->frame_pointer = (uint64_t) context->uc_mcontext.gregs[REG_RBP];
+    snapshot->link_register = 0;
+#else
+    return false;
+#endif
+    return snapshot->program_counter != 0 && snapshot->stack_pointer != 0;
+}
+
+static uint32_t snapshot_checksum(const struct otel_native_crash_snapshot *snapshot) {
+    const unsigned char *bytes = (const unsigned char *) snapshot;
+    uint32_t checksum = OTEL_NCS_FNV_OFFSET_BASIS;
+    for (size_t index = 0; index < offsetof(struct otel_native_crash_snapshot, checksum); index++) {
+        checksum ^= bytes[index];
+        checksum *= OTEL_NCS_FNV_PRIME;
+    }
+    return checksum;
+}
+
+static size_t capture_stack(uint64_t stack_pointer, unsigned char *destination) {
+    if (stack_pointer == 0 || stack_pointer > (uint64_t) UINTPTR_MAX) {
+        return 0;
+    }
+    struct iovec local = {
+        .iov_base = destination,
+        .iov_len = OTEL_NCS_STACK_CAPACITY,
+    };
+    struct iovec remote = {
+        .iov_base = (void *) (uintptr_t) stack_pointer,
+        .iov_len = OTEL_NCS_STACK_CAPACITY,
+    };
+    ssize_t copied =
+        syscall(SYS_process_vm_readv, getpid(), &local, 1UL, &remote, 1UL, 0UL);
+    if (copied <= 0) {
+        return 0;
+    }
+    if ((size_t) copied > OTEL_NCS_STACK_CAPACITY) {
+        return OTEL_NCS_STACK_CAPACITY;
+    }
+    return (size_t) copied;
+}
+
+static bool write_crash_snapshot(
+    int signal_number,
+    uint64_t timestamp_epoch_nanos,
+    void *user_context) {
+    if (!crash_snapshot_prepared || !capture_registers(user_context, &crash_snapshot)) {
+        return false;
+    }
+    crash_snapshot.signal_number = (uint32_t) signal_number;
+    crash_snapshot.timestamp_epoch_nanos = timestamp_epoch_nanos;
+    crash_snapshot.stack_start = crash_snapshot.stack_pointer;
+    crash_snapshot.stack_size =
+        (uint32_t) capture_stack(crash_snapshot.stack_pointer, crash_snapshot.stack);
+    crash_snapshot.checksum = snapshot_checksum(&crash_snapshot);
+    return write_atomic_file(
+        crash_snapshot_path,
+        temporary_crash_snapshot_path,
+        &crash_snapshot,
+        sizeof(crash_snapshot),
+        false);
+}
+
 static bool write_crash_marker_at(
     const char *record_path,
     const char *temporary_record_path,
@@ -134,25 +425,11 @@ static bool write_crash_marker_at(
         return false;
     }
 
-    int file_descriptor =
-        open(temporary_record_path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
-    if (file_descriptor < 0) {
-        return false;
-    }
-
-    bool complete = write_all(file_descriptor, marker, marker_length) && fsync(file_descriptor) == 0;
-    if (close(file_descriptor) != 0) {
-        complete = false;
-    }
-    if (!complete || rename(temporary_record_path, record_path) != 0) {
-        unlink(temporary_record_path);
-        return false;
-    }
-    return true;
+    return write_atomic_file(record_path, temporary_record_path, marker, marker_length, true);
 }
 
-static void write_crash_marker(int signal_number) {
-    // Snapshot capture must reuse this timestamp; see SNAPSHOT_FORMAT.md.
+static void record_crash(int signal_number, void *user_context) {
+    // The marker and snapshot must share this exact timestamp; see SNAPSHOT_FORMAT.md.
     struct timespec crash_time;
     if (clock_gettime(CLOCK_REALTIME, &crash_time) != 0 || crash_time.tv_sec < 0 ||
         crash_time.tv_nsec < 0) {
@@ -164,11 +441,15 @@ static void write_crash_marker(int signal_number) {
     if (seconds > (UINT64_MAX - nanoseconds) / NANOS_PER_SECOND) {
         return;
     }
+    uint64_t timestamp_epoch_nanos = seconds * NANOS_PER_SECOND + nanoseconds;
+    if (!write_crash_snapshot(signal_number, timestamp_epoch_nanos, user_context)) {
+        unlink(crash_snapshot_path);
+    }
     (void) write_crash_marker_at(
         crash_record_path,
         temporary_crash_record_path,
         signal_number,
-        seconds * NANOS_PER_SECOND + nanoseconds);
+        timestamp_epoch_nanos);
 }
 
 static void rollback_installed_handlers(void) {
@@ -285,10 +566,11 @@ static void handle_signal(
     int signal_number,
     siginfo_t *signal_info,
     void *user_context) {
-    (void) user_context;
     int saved_errno = errno;
-    if (!atomic_flag_test_and_set_explicit(&handling_signal, memory_order_relaxed)) {
-        write_crash_marker(signal_number);
+    bool first_signal =
+        !atomic_flag_test_and_set_explicit(&handling_signal, memory_order_relaxed);
+    if (first_signal) {
+        record_crash(signal_number, user_context);
     }
     errno = saved_errno;
     restore_previous_handler_and_reraise(signal_number, signal_info);
@@ -356,21 +638,37 @@ static bool build_crash_record_paths(
     return true;
 }
 
-static bool install_for_path(const char *path, size_t path_length) {
+static bool install_for_paths(
+    const char *marker_path,
+    size_t marker_path_length,
+    const char *snapshot_path,
+    size_t snapshot_path_length) {
     pthread_mutex_lock(&install_mutex);
     bool installed;
     if (handlers_installed) {
-        installed = strcmp(crash_record_path, path) == 0;
+        installed =
+            strcmp(crash_record_path, marker_path) == 0 &&
+            strcmp(crash_snapshot_path, snapshot_path) == 0;
     } else {
         installed =
             build_crash_record_paths(
-                path,
-                path_length,
+                marker_path,
+                marker_path_length,
                 crash_record_path,
                 sizeof(crash_record_path),
                 temporary_crash_record_path,
                 sizeof(temporary_crash_record_path)) &&
-            install_handlers();
+            build_crash_record_paths(
+                snapshot_path,
+                snapshot_path_length,
+                crash_snapshot_path,
+                sizeof(crash_snapshot_path),
+                temporary_crash_snapshot_path,
+                sizeof(temporary_crash_snapshot_path));
+        if (installed) {
+            crash_snapshot_prepared = prepare_crash_snapshot();
+            installed = install_handlers();
+        }
         handlers_installed = installed;
     }
     pthread_mutex_unlock(&install_mutex);
@@ -381,25 +679,38 @@ JNIEXPORT jboolean JNICALL
 Java_io_opentelemetry_android_instrumentation_nativecrash_NativeCrashJni_install(
     JNIEnv *environment,
     jclass native_crash_jni,
-    jstring marker_path) {
+    jstring marker_path,
+    jstring snapshot_path) {
     (void) native_crash_jni;
-    if (marker_path == NULL) {
+    if (marker_path == NULL || snapshot_path == NULL) {
         return JNI_FALSE;
     }
 
-    jsize path_length = (*environment)->GetStringUTFLength(environment, marker_path);
-    if (path_length <= 0) {
+    jsize marker_path_length = (*environment)->GetStringUTFLength(environment, marker_path);
+    jsize snapshot_path_length = (*environment)->GetStringUTFLength(environment, snapshot_path);
+    if (marker_path_length <= 0 || snapshot_path_length <= 0) {
         return JNI_FALSE;
     }
 
-    const char *path = (*environment)->GetStringUTFChars(environment, marker_path, NULL);
-    if (path == NULL) {
+    const char *marker = (*environment)->GetStringUTFChars(environment, marker_path, NULL);
+    if (marker == NULL) {
+        return JNI_FALSE;
+    }
+    const char *snapshot = (*environment)->GetStringUTFChars(environment, snapshot_path, NULL);
+    if (snapshot == NULL) {
+        (*environment)->ReleaseStringUTFChars(environment, marker_path, marker);
         return JNI_FALSE;
     }
 
-    bool installed = install_for_path(path, (size_t) path_length);
+    bool installed =
+        install_for_paths(
+            marker,
+            (size_t) marker_path_length,
+            snapshot,
+            (size_t) snapshot_path_length);
 
-    (*environment)->ReleaseStringUTFChars(environment, marker_path, path);
+    (*environment)->ReleaseStringUTFChars(environment, snapshot_path, snapshot);
+    (*environment)->ReleaseStringUTFChars(environment, marker_path, marker);
     return installed ? JNI_TRUE : JNI_FALSE;
 }
 

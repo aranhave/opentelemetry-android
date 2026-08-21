@@ -6,5 +6,9 @@
 package io.opentelemetry.android.instrumentation.nativecrash
 
 internal object NativeCrashJni {
-    @JvmStatic external fun install(crashRecordPath: String): Boolean
+    @JvmStatic
+    external fun install(
+        crashRecordPath: String,
+        crashSnapshotPath: String,
+    ): Boolean
 }

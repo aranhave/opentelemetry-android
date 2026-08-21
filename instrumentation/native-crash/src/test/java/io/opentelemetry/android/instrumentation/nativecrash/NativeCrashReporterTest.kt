@@ -93,7 +93,7 @@ class NativeCrashReporterTest {
                     store
                 },
                 executor = { task -> queuedTask = task },
-                signalHandlerInstaller = { _ ->
+                signalHandlerInstaller = { _, _ ->
                     assertThat(store.readCrashRecord()).isEqualTo(NativeCrashReadResult.Missing)
                     assertThat(store.readContext()?.sessionId).isEqualTo("current-session")
                     assertThat(
@@ -141,7 +141,7 @@ class NativeCrashReporterTest {
             NativeCrashInstrumentation(
                 storeFactory = { store },
                 executor = directExecutor,
-                signalHandlerInstaller = { _ ->
+                signalHandlerInstaller = { _, _ ->
                     signalHandlerInstalled = true
                     true
                 },
@@ -179,7 +179,7 @@ class NativeCrashReporterTest {
             NativeCrashInstrumentation(
                 storeFactory = { store },
                 executor = directExecutor,
-                signalHandlerInstaller = { _ ->
+                signalHandlerInstaller = { _, _ ->
                     signalHandlerInstalled = true
                     true
                 },
@@ -217,48 +217,54 @@ class NativeCrashReporterTest {
     @Test
     fun `loads the native library and installs the handler`() {
         val marker = File(tempDir, "missing/native-crash-record.properties")
+        val snapshot = File(tempDir, "missing/native-crash-snapshot.bin")
         var loadedLibrary: String? = null
         var installedPath: String? = null
+        var installedSnapshotPath: String? = null
         val installer =
             JniNativeSignalHandlerInstaller(
                 loadLibrary = { loadedLibrary = it },
-                nativeInstall = { path ->
+                nativeInstall = { path, snapshotPath ->
                     installedPath = path
+                    installedSnapshotPath = snapshotPath
                     true
                 },
             )
 
-        assertThat(installer.install(marker)).isTrue()
+        assertThat(installer.install(marker, snapshot)).isTrue()
         assertThat(loadedLibrary).isEqualTo("otel_android_native_crash")
         assertThat(installedPath).isEqualTo(marker.absolutePath)
+        assertThat(installedSnapshotPath).isEqualTo(snapshot.absolutePath)
     }
 
     @Test
     fun `does not load the native library when the marker directory is unusable`() {
         val fileInsteadOfDirectory = File(tempDir, "not-a-directory").apply { writeText("occupied") }
         val marker = File(fileInsteadOfDirectory, "native-crash-record.properties")
+        val snapshot = File(fileInsteadOfDirectory, "native-crash-snapshot.bin")
         var libraryLoaded = false
         val installer =
             JniNativeSignalHandlerInstaller(
                 loadLibrary = { libraryLoaded = true },
-                nativeInstall = { _ -> true },
+                nativeInstall = { _, _ -> true },
             )
 
-        assertThat(installer.install(marker)).isFalse()
+        assertThat(installer.install(marker, snapshot)).isFalse()
         assertThat(libraryLoaded).isFalse()
     }
 
     @Test
     fun `returns false when the native library cannot be loaded`() {
         val marker = File(tempDir, "native-crash-record.properties")
+        val snapshot = File(tempDir, "native-crash-snapshot.bin")
         val failure = UnsatisfiedLinkError("missing library")
         val installer =
             JniNativeSignalHandlerInstaller(
                 loadLibrary = { throw failure },
-                nativeInstall = { _ -> true },
+                nativeInstall = { _, _ -> true },
             )
 
-        assertThat(installer.install(marker)).isFalse()
+        assertThat(installer.install(marker, snapshot)).isFalse()
         verify {
             Log.w(
                 any<String>(),
@@ -296,7 +302,7 @@ class NativeCrashReporterTest {
                     store
                 },
                 executor = directExecutor,
-                signalHandlerInstaller = { markerPath ->
+                signalHandlerInstaller = { markerPath, _ ->
                     installedMarkerPath = markerPath
                     true
                 },
@@ -334,7 +340,7 @@ class NativeCrashReporterTest {
             NativeCrashInstrumentation(
                 storeFactory = { store },
                 executor = directExecutor,
-                signalHandlerInstaller = { _ -> false },
+                signalHandlerInstaller = { _, _ -> false },
             )
 
         instrumentation.install(context, fakeRum(sessionProvider))

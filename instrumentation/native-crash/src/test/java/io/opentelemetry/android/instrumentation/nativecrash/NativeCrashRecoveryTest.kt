@@ -328,7 +328,7 @@ class NativeCrashRecoveryTest {
             NativeCrashInstrumentation(
                 storeFactory = { store },
                 executor = directExecutor,
-                signalHandlerInstaller = { _ ->
+                signalHandlerInstaller = { _, _ ->
                     signalHandlerInstalled = true
                     true
                 },
