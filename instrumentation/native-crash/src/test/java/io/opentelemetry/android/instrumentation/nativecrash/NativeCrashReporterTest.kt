@@ -26,6 +26,7 @@ import io.opentelemetry.api.OpenTelemetry
 import io.opentelemetry.api.common.AttributeKey.stringKey
 import io.opentelemetry.api.common.Attributes
 import io.opentelemetry.kotlin.semconv.ExceptionAttributes.EXCEPTION_MESSAGE
+import io.opentelemetry.kotlin.semconv.ExceptionAttributes.EXCEPTION_STACKTRACE
 import io.opentelemetry.kotlin.semconv.ExceptionAttributes.EXCEPTION_TYPE
 import io.opentelemetry.kotlin.semconv.IncubatingApi
 import io.opentelemetry.kotlin.semconv.OsAttributes.OS_NAME
@@ -35,6 +36,7 @@ import io.opentelemetry.kotlin.semconv.SessionAttributes.SESSION_ID
 import io.opentelemetry.sdk.common.Clock
 import io.opentelemetry.sdk.testing.junit5.OpenTelemetryExtension
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -42,6 +44,8 @@ import org.junit.jupiter.api.extension.RegisterExtension
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.time.Instant
 import java.util.Properties
 
@@ -90,8 +94,8 @@ class NativeCrashReporterTest {
                     store
                 },
                 executor = { task -> queuedTask = task },
-                signalHandlerInstaller = {
-                    assertThat(store.readCrashRecord()).isNull()
+                signalHandlerInstaller = { _ ->
+                    assertThat(store.readCrashRecord()).isEqualTo(NativeCrashReadResult.Missing)
                     assertThat(store.readContext()?.sessionId).isEqualTo("current-session")
                     assertThat(
                         otelTesting.logRecords
@@ -108,7 +112,7 @@ class NativeCrashReporterTest {
 
         assertThat(storeCreated).isFalse()
         assertThat(signalHandlerInstalled).isFalse()
-        assertThat(store.readCrashRecord()).isNotNull()
+        assertThat(store.readCrashRecord()).isInstanceOf(NativeCrashReadResult.Success::class.java)
         assertThat(queuedTask).isNotNull()
 
         queuedTask!!.run()
@@ -122,7 +126,7 @@ class NativeCrashReporterTest {
         val marker = File(tempDir, "native-crash-record.properties")
         val store = mockk<NativeCrashStore>(relaxed = true)
         every { store.crashRecordPath } returns marker
-        every { store.readCrashRecord() } returns null
+        every { store.readCrashRecord() } returns NativeCrashReadResult.Missing
         every { store.readContext() } returns null
         every { store.writeContext(any()) } returns false
         val packageManager = mockk<PackageManager>()
@@ -138,7 +142,7 @@ class NativeCrashReporterTest {
             NativeCrashInstrumentation(
                 storeFactory = { store },
                 executor = directExecutor,
-                signalHandlerInstaller = {
+                signalHandlerInstaller = { _ ->
                     signalHandlerInstalled = true
                     true
                 },
@@ -151,6 +155,43 @@ class NativeCrashReporterTest {
             Log.w(
                 any<String>(),
                 "Native crash signal handler disabled because crash context could not be persisted",
+            )
+        }
+    }
+
+    @Test
+    fun `does not replace crash context or install handlers while recovery is pending`() {
+        val store = mockk<NativeCrashStore>(relaxed = true)
+        val savedContext = crashContext("crashed")
+        every { store.readContext() } returns savedContext
+        every { store.readCrashRecord() } returns NativeCrashReadResult.RetryableFailure
+        val packageManager = mockk<PackageManager>()
+        val applicationContext = mockk<Context>()
+        val context = mockk<Context>()
+        every { context.applicationContext } returns applicationContext
+        every { applicationContext.packageManager } returns packageManager
+        every { applicationContext.packageName } returns "test.app"
+        every { packageManager.getPackageInfo("test.app", 0) } throws
+            PackageManager.NameNotFoundException()
+        var signalHandlerInstalled = false
+        val instrumentation =
+            NativeCrashInstrumentation(
+                storeFactory = { store },
+                executor = directExecutor,
+                signalHandlerInstaller = { _ ->
+                    signalHandlerInstalled = true
+                    true
+                },
+            )
+
+        instrumentation.install(context, fakeRum())
+
+        assertThat(signalHandlerInstalled).isFalse()
+        verify(exactly = 0) { store.writeContext(any()) }
+        verify {
+            Log.w(
+                any<String>(),
+                "Native crash signal handler disabled while previous crash recovery is pending",
             )
         }
     }
@@ -199,7 +240,7 @@ class NativeCrashReporterTest {
         val installer =
             JniNativeSignalHandlerInstaller(
                 loadLibrary = { libraryLoaded = true },
-                nativeInstall = { true },
+                nativeInstall = { _ -> true },
             )
 
         assertThat(installer.install(marker)).isFalse()
@@ -213,7 +254,7 @@ class NativeCrashReporterTest {
         val installer =
             JniNativeSignalHandlerInstaller(
                 loadLibrary = { throw failure },
-                nativeInstall = { true },
+                nativeInstall = { _ -> true },
             )
 
         assertThat(installer.install(marker)).isFalse()
@@ -292,7 +333,7 @@ class NativeCrashReporterTest {
             NativeCrashInstrumentation(
                 storeFactory = { store },
                 executor = directExecutor,
-                signalHandlerInstaller = { false },
+                signalHandlerInstaller = { _ -> false },
             )
 
         instrumentation.install(context, fakeRum(sessionProvider))
@@ -330,8 +371,148 @@ class NativeCrashReporterTest {
         assertThat(log.attributes.get(stringKey(SERVICE_VERSION))).isEqualTo("crashed-version")
         assertThat(log.attributes.get(stringKey(OS_NAME))).isEqualTo("crashed-os")
         assertThat(log.attributes.get(stringKey(OS_VERSION))).isEqualTo("crashed-os-version")
-        assertThat(store.readCrashRecord()).isNull()
+        assertThat(store.readCrashRecord()).isEqualTo(NativeCrashReadResult.Missing)
         assertThat(store.readContext()).isEqualTo(crashContext("current"))
+    }
+
+    @Test
+    fun `adds recovered native frames to the crash event`() {
+        val store = FileNativeCrashStore(tempDir)
+        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
+        store.crashSnapshotPath.writeBytes(snapshotBytes())
+
+        reporter(store).replayPreviousCrash()
+
+        assertThat(
+            otelTesting.logRecords
+                .single()
+                .attributes
+                .get(stringKey(EXCEPTION_STACKTRACE)),
+        ).startsWith("#00 pc 0000000000000120  libapp.so")
+        assertThat(store.crashRecordPath).doesNotExist()
+        assertThat(store.crashSnapshotPath).doesNotExist()
+    }
+
+    @Test
+    fun `emits the crash without frames when the snapshot is malformed`() {
+        val store = FileNativeCrashStore(tempDir)
+        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
+        store.crashSnapshotPath.writeBytes(ByteArray(NativeCrashSnapshotLayout.RECORD_SIZE))
+
+        reporter(store).replayPreviousCrash()
+
+        assertThat(
+            otelTesting.logRecords
+                .single()
+                .attributes
+                .get(stringKey(EXCEPTION_STACKTRACE)),
+        ).isNull()
+        assertThat(store.crashSnapshotPath).doesNotExist()
+    }
+
+    @Test
+    fun `removes an orphaned snapshot when no marker exists`() {
+        val store = FileNativeCrashStore(tempDir)
+        store.crashSnapshotPath.apply {
+            parentFile?.mkdirs()
+            writeBytes(snapshotBytes())
+        }
+
+        reporter(store).replayPreviousCrash()
+
+        assertThat(otelTesting.logRecords).isEmpty()
+        assertThat(store.crashSnapshotPath).doesNotExist()
+    }
+
+    @Test
+    fun `retains recovery files when the marker read can be retried`() {
+        val store = mockk<NativeCrashStore>(relaxed = true)
+        every { store.readContext() } returns null
+        every { store.readCrashRecord() } returns NativeCrashReadResult.RetryableFailure
+
+        reporter(store).replayPreviousCrash()
+
+        assertThat(otelTesting.logRecords).isEmpty()
+        verify(exactly = 0) {
+            store.deleteCrashRecord()
+            store.deleteCrashSnapshot()
+        }
+    }
+
+    @Test
+    fun `retains recovery files when the snapshot read can be retried`() {
+        val store = mockk<NativeCrashStore>(relaxed = true)
+        val record = NativeCrashRecord(11, Instant.ofEpochSecond(1_783_598_400))
+        every { store.readContext() } returns null
+        every { store.readCrashRecord() } returns NativeCrashReadResult.Success(record)
+        every { store.readCrashStackTrace(record) } returns NativeCrashReadResult.RetryableFailure
+
+        reporter(store).replayPreviousCrash()
+
+        assertThat(otelTesting.logRecords).isEmpty()
+        verify(exactly = 0) {
+            store.deleteCrashRecord()
+            store.deleteCrashSnapshot()
+        }
+    }
+
+    @Test
+    fun `retains recovery files when crash emission fails`() {
+        val store = FileNativeCrashStore(tempDir)
+        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
+        store.crashSnapshotPath.writeBytes(snapshotBytes())
+        val rum = mockk<OpenTelemetryRum>()
+        every { rum.openTelemetry } throws IllegalStateException("logger unavailable")
+
+        assertThatThrownBy { NativeCrashReporter(store, rum).replayPreviousCrash() }
+            .isInstanceOf(IllegalStateException::class.java)
+
+        assertThat(store.crashRecordPath).exists()
+        assertThat(store.crashSnapshotPath).exists()
+    }
+
+    @Test
+    fun `retains the snapshot when marker cleanup fails`() {
+        val store =
+            FileNativeCrashStore(tempDir) { file ->
+                file.name != "native-crash-record.properties"
+            }
+        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
+        store.crashSnapshotPath.writeBytes(snapshotBytes())
+
+        val result = reporter(store).replayPreviousCrash()
+
+        assertThat(otelTesting.logRecords).hasSize(1)
+        assertThat(result).isEqualTo(NativeCrashReplayResult.RETRY_PENDING)
+        assertThat(store.crashRecordPath).exists()
+        assertThat(store.crashSnapshotPath).exists()
+    }
+
+    @Test
+    fun `retries retained recovery files on the next launch`() {
+        var failMarkerDeletion = true
+        val store =
+            FileNativeCrashStore(tempDir) { file ->
+                if (file.name == "native-crash-record.properties" && failMarkerDeletion) {
+                    failMarkerDeletion = false
+                    false
+                } else {
+                    file.delete()
+                }
+            }
+        writeMarker(signalNumber = 11, timestampNanos = 1_783_598_400_123_456_789L)
+        store.crashSnapshotPath.writeBytes(snapshotBytes())
+        val reporter = reporter(store)
+
+        assertThat(reporter.replayPreviousCrash()).isEqualTo(NativeCrashReplayResult.RETRY_PENDING)
+        assertThat(store.crashRecordPath).exists()
+        assertThat(store.crashSnapshotPath).exists()
+        otelTesting.clearLogRecords()
+
+        assertThat(reporter.replayPreviousCrash()).isEqualTo(NativeCrashReplayResult.COMPLETE)
+        assertThat(otelTesting.logRecords).hasSize(1)
+        assertThat(store.crashRecordPath).doesNotExist()
+        assertThat(store.crashSnapshotPath).doesNotExist()
     }
 
     @Test
@@ -347,9 +528,11 @@ class NativeCrashReporterTest {
 
         assertThat(store.readCrashRecord())
             .isEqualTo(
-                NativeCrashRecord(
-                    signalNumber = 11,
-                    timestamp = Instant.ofEpochSecond(1_783_598_400, 123_456_789),
+                NativeCrashReadResult.Success(
+                    NativeCrashRecord(
+                        signalNumber = 11,
+                        timestamp = Instant.ofEpochSecond(1_783_598_400, 123_456_789),
+                    ),
                 ),
             )
     }
@@ -450,7 +633,8 @@ class NativeCrashReporterTest {
                 )
             }
 
-            assertThat(store.readCrashRecord()).isNull()
+            assertThat(store.readCrashRecord()).isEqualTo(NativeCrashReadResult.Invalid)
+            reporter(store).replayPreviousCrash()
             assertThat(markerFile()).doesNotExist()
         }
     }
@@ -514,6 +698,37 @@ class NativeCrashReporterTest {
 
     private fun writeContext(context: NativeCrashContext) {
         FileNativeCrashStore(tempDir).writeContext(context)
+    }
+
+    private fun snapshotBytes(): ByteArray {
+        val bytes = ByteArray(NativeCrashSnapshotLayout.RECORD_SIZE)
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put("OTELNCS\u0000".toByteArray())
+        buffer.putInt(1)
+        buffer.putInt(NativeCrashArchitecture.ARM64.id)
+        buffer.putInt(bytes.size)
+        buffer.putInt(11)
+        buffer.putLong(1_783_598_400_123_456_789L)
+        buffer.putLong(0x1120)
+        buffer.putLong(0x7000)
+        buffer.putLong(0x7000)
+        buffer.putLong(0)
+        buffer.putInt(1)
+        buffer.putInt(0)
+        buffer.putLong(0x7000)
+        buffer.position(NativeCrashSnapshotLayout.MODULES_OFFSET)
+        buffer.putLong(0x1000)
+        buffer.putLong(0x1100)
+        buffer.putLong(0x2000)
+        buffer.put("libapp.so".toByteArray())
+        buffer.putInt(NativeCrashSnapshotLayout.MODULES_OFFSET + 88, 3)
+        buffer.position(NativeCrashSnapshotLayout.MODULES_OFFSET + 92)
+        buffer.put(byteArrayOf(0x01, 0x23, 0xfe.toByte()))
+        buffer.putInt(
+            NativeCrashSnapshotLayout.CHECKSUM_OFFSET,
+            NativeCrashSnapshotParser.checksum(bytes).toInt(),
+        )
+        return bytes
     }
 
     private fun markerFile(): File = File(tempDir, "native-crash-record.properties")

@@ -22,6 +22,7 @@ import io.opentelemetry.api.common.AttributeKey.stringKey
 import io.opentelemetry.api.common.Attributes
 import io.opentelemetry.api.common.AttributesBuilder
 import io.opentelemetry.kotlin.semconv.ExceptionAttributes.EXCEPTION_MESSAGE
+import io.opentelemetry.kotlin.semconv.ExceptionAttributes.EXCEPTION_STACKTRACE
 import io.opentelemetry.kotlin.semconv.ExceptionAttributes.EXCEPTION_TYPE
 import io.opentelemetry.kotlin.semconv.IncubatingApi
 import io.opentelemetry.kotlin.semconv.OsAttributes.OS_NAME
@@ -56,10 +57,18 @@ class NativeCrashInstrumentation internal constructor(
         executor.execute {
             val store = storeFactory(applicationContext)
             val crashContext = applicationContext.currentCrashContext(openTelemetryRum)
-            NativeCrashReporter(
-                store = store,
-                openTelemetryRum = openTelemetryRum,
-            ).replayPreviousCrash()
+            val replayResult =
+                NativeCrashReporter(
+                    store = store,
+                    openTelemetryRum = openTelemetryRum,
+                ).replayPreviousCrash()
+            if (replayResult == NativeCrashReplayResult.RETRY_PENDING) {
+                Log.w(
+                    RumConstants.OTEL_RUM_LOG_TAG,
+                    "Native crash signal handler disabled while previous crash recovery is pending",
+                )
+                return@execute
+            }
             if (!store.writeContext(crashContext)) {
                 Log.w(
                     RumConstants.OTEL_RUM_LOG_TAG,
@@ -135,21 +144,67 @@ internal class NativeCrashReporter(
     private val store: NativeCrashStore,
     private val openTelemetryRum: OpenTelemetryRum,
 ) {
-    fun replayPreviousCrash() {
+    fun replayPreviousCrash(): NativeCrashReplayResult {
         val crashContext = store.readContext()
-        store.readCrashRecord()?.let { record -> replay(record, crashContext) }
+        val record =
+            when (val result = store.readCrashRecord()) {
+                NativeCrashReadResult.Missing -> {
+                    store.deleteCrashSnapshot()
+                    return NativeCrashReplayResult.COMPLETE
+                }
+
+                NativeCrashReadResult.Invalid -> {
+                    return if (store.deleteCrashRecord()) {
+                        NativeCrashReplayResult.COMPLETE
+                    } else {
+                        NativeCrashReplayResult.RETRY_PENDING
+                    }
+                }
+
+                NativeCrashReadResult.RetryableFailure -> {
+                    return NativeCrashReplayResult.RETRY_PENDING
+                }
+
+                is NativeCrashReadResult.Success -> {
+                    result.value
+                }
+            }
+        val stackTrace =
+            when (val result = store.readCrashStackTrace(record)) {
+                NativeCrashReadResult.Missing -> {
+                    null
+                }
+
+                NativeCrashReadResult.Invalid -> {
+                    store.deleteCrashSnapshot()
+                    null
+                }
+
+                NativeCrashReadResult.RetryableFailure -> {
+                    return NativeCrashReplayResult.RETRY_PENDING
+                }
+
+                is NativeCrashReadResult.Success -> {
+                    result.value
+                }
+            }
+        return replay(record, crashContext, stackTrace)
     }
 
     private fun replay(
         record: NativeCrashRecord,
         crashContext: NativeCrashContext?,
-    ) {
+        stackTrace: NativeCrashStackTrace?,
+    ): NativeCrashReplayResult {
         val attributes = Attributes.builder()
         attributes.put(stringKey(EXCEPTION_TYPE), record.signalName)
         attributes.put(
             stringKey(EXCEPTION_MESSAGE),
             "Native crash signal ${record.signalName} (${record.signalNumber})",
         )
+        stackTrace?.takeIf { it.frames.isNotEmpty() }?.let {
+            attributes.put(stringKey(EXCEPTION_STACKTRACE), it.toString())
+        }
         crashContext?.addTo(attributes)
 
         openTelemetryRum.openTelemetry.logsBridge
@@ -160,63 +215,107 @@ internal class NativeCrashReporter(
             .setTimestamp(record.timestamp)
             .setAllAttributes(attributes.build())
             .emit()
-        store.deleteCrashRecord()
+        return if (store.deleteCrashRecord()) {
+            NativeCrashReplayResult.COMPLETE
+        } else {
+            NativeCrashReplayResult.RETRY_PENDING
+        }
     }
+}
+
+internal enum class NativeCrashReplayResult {
+    COMPLETE,
+    RETRY_PENDING,
 }
 
 internal interface NativeCrashStore {
     val crashRecordPath: File
+    val crashSnapshotPath: File
 
-    fun readCrashRecord(): NativeCrashRecord?
+    fun readCrashRecord(): NativeCrashReadResult<NativeCrashRecord>
 
-    fun deleteCrashRecord()
+    fun readCrashStackTrace(record: NativeCrashRecord): NativeCrashReadResult<NativeCrashStackTrace>
+
+    fun deleteCrashRecord(): Boolean
+
+    fun deleteCrashSnapshot(): Boolean
 
     fun readContext(): NativeCrashContext?
 
     fun writeContext(context: NativeCrashContext): Boolean
 }
 
+internal sealed interface NativeCrashReadResult<out T> {
+    data object Missing : NativeCrashReadResult<Nothing>
+
+    data object Invalid : NativeCrashReadResult<Nothing>
+
+    data object RetryableFailure : NativeCrashReadResult<Nothing>
+
+    data class Success<T>(
+        val value: T,
+    ) : NativeCrashReadResult<T>
+}
+
 internal class FileNativeCrashStore(
     private val directory: File,
+    private val fileDeleter: (File) -> Boolean = File::delete,
 ) : NativeCrashStore {
     private val contextPath = File(directory, "native-crash-context.properties")
     override val crashRecordPath = File(directory, "native-crash-record.properties")
+    override val crashSnapshotPath = File(directory, "native-crash-snapshot.bin")
 
-    override fun readCrashRecord(): NativeCrashRecord? {
+    override fun readCrashRecord(): NativeCrashReadResult<NativeCrashRecord> {
         if (!crashRecordPath.isFile) {
-            return null
+            return NativeCrashReadResult.Missing
         }
         val properties =
             try {
                 crashRecordPath.readProperties()
             } catch (error: IllegalArgumentException) {
-                deleteCrashRecord()
-                return null
+                return NativeCrashReadResult.Invalid
             } catch (error: IOException) {
                 Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to read native crash marker", error)
-                deleteCrashRecord()
-                return null
+                return NativeCrashReadResult.RetryableFailure
             } catch (error: SecurityException) {
                 Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to read native crash marker", error)
-                deleteCrashRecord()
-                return null
+                return NativeCrashReadResult.RetryableFailure
             }
-        val record = properties.toCrashRecordOrNull()
-        if (record == null) {
-            deleteCrashRecord()
-        }
-        return record
+        val record = properties.toCrashRecordOrNull() ?: return NativeCrashReadResult.Invalid
+        return NativeCrashReadResult.Success(record)
     }
 
-    override fun deleteCrashRecord() {
-        runCatching {
-            if (crashRecordPath.isFile && !crashRecordPath.delete()) {
-                throw IOException("Failed to delete native crash marker")
-            }
-        }.onFailure { error ->
-            Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to delete native crash marker", error)
+    override fun deleteCrashRecord(): Boolean {
+        val markerDeleted = deleteFile(crashRecordPath, "marker")
+        if (markerDeleted) {
+            deleteCrashSnapshot()
         }
+        return markerDeleted
     }
+
+    override fun readCrashStackTrace(record: NativeCrashRecord): NativeCrashReadResult<NativeCrashStackTrace> {
+        if (!crashSnapshotPath.isFile) {
+            return NativeCrashReadResult.Missing
+        }
+        val bytes =
+            try {
+                crashSnapshotPath.readExactBytes(NativeCrashSnapshotLayout.RECORD_SIZE)
+            } catch (error: IOException) {
+                Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to read native crash snapshot", error)
+                return NativeCrashReadResult.RetryableFailure
+            } catch (error: SecurityException) {
+                Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to read native crash snapshot", error)
+                return NativeCrashReadResult.RetryableFailure
+            }
+        if (bytes == null) {
+            return NativeCrashReadResult.Invalid
+        }
+        val snapshot = NativeCrashSnapshotParser.parse(bytes, record) ?: return NativeCrashReadResult.Invalid
+        val stackTrace = NativeCrashStackUnwinder.unwind(snapshot)
+        return NativeCrashReadResult.Success(stackTrace)
+    }
+
+    override fun deleteCrashSnapshot(): Boolean = deleteFile(crashSnapshotPath, "snapshot")
 
     override fun readContext(): NativeCrashContext? {
         val properties = runCatching { contextPath.readProperties() }.getOrNull() ?: return null
@@ -278,6 +377,19 @@ internal class FileNativeCrashStore(
             )
         return context.takeUnless { it.isEmpty() }
     }
+
+    private fun deleteFile(
+        path: File,
+        description: String,
+    ): Boolean =
+        runCatching {
+            if (path.isFile && !fileDeleter(path)) {
+                throw IOException("Failed to delete native crash $description")
+            }
+            true
+        }.onFailure { error ->
+            Log.w(RumConstants.OTEL_RUM_LOG_TAG, "Failed to delete native crash $description", error)
+        }.getOrDefault(false)
 
     private companion object {
         const val SIGNAL_NUMBER_KEY = "signal.number"
@@ -351,6 +463,26 @@ private fun Properties.nonBlankProperty(key: String): String? = getProperty(key)
 private fun File.readProperties(): Properties =
     Properties().also { properties ->
         FileInputStream(this).use { properties.load(it) }
+    }
+
+private fun File.readExactBytes(expectedSize: Int): ByteArray? =
+    FileInputStream(this).use { input ->
+        if (input.channel.size() != expectedSize.toLong()) {
+            return null
+        }
+        val result = ByteArray(expectedSize)
+        var offset = 0
+        while (offset < result.size) {
+            val read = input.read(result, offset, result.size - offset)
+            if (read <= 0) {
+                throw IOException("Native crash snapshot changed while it was being read")
+            }
+            offset += read
+        }
+        if (input.read() != -1) {
+            throw IOException("Native crash snapshot changed while it was being read")
+        }
+        result
     }
 
 private const val NANOS_PER_SECOND = 1_000_000_000L
