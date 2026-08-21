@@ -16,9 +16,15 @@ import java.time.Instant
 class NativeCrashSnapshotParserTest {
     @Test
     fun `uses the contract checksum constants`() {
+        val bytes = ByteArray(NativeCrashSnapshotLayout.RECORD_SIZE)
+        bytes[0] = 1
+        bytes[1] = 2
+        bytes[2] = 3
+        bytes[NativeCrashSnapshotLayout.CHECKSUM_OFFSET - 1] = 0xff.toByte()
+
         assertThat(
-            NativeCrashSnapshotParser.checksum(ByteArray(NativeCrashSnapshotLayout.RECORD_SIZE)),
-        ).isEqualTo(0x06260155L)
+            NativeCrashSnapshotParser.checksum(bytes),
+        ).isEqualTo(0x974ee9fcL)
     }
 
     @Test
@@ -114,6 +120,37 @@ class NativeCrashSnapshotParserTest {
                 assertThat(snapshot!!.modules).isEmpty()
             }
         }
+
+    @Test
+    fun `keeps valid module entries after a malformed entry`() {
+        val snapshot =
+            NativeCrashSnapshotParser.parse(
+                SnapshotBuilder().build { buffer ->
+                    buffer.putInt(NativeCrashSnapshotLayout.MODULE_COUNT_OFFSET, 2)
+                    buffer.putLong(MODULE_OFFSET, 0x1200)
+
+                    val secondModuleOffset = MODULE_OFFSET + NativeCrashSnapshotLayout.MODULE_ENTRY_SIZE
+                    buffer.putLong(secondModuleOffset, 0x3000)
+                    buffer.putLong(secondModuleOffset + 8, 0x3100)
+                    buffer.putLong(secondModuleOffset + 16, 0x4000)
+                    buffer.position(secondModuleOffset + 24)
+                    buffer.put("libsecond.so".toByteArray())
+                },
+                crashRecord,
+            )
+
+        assertThat(snapshot).isNotNull()
+        assertThat(snapshot!!.modules)
+            .containsExactly(
+                NativeCrashModule(
+                    loadBias = 0x3000UL,
+                    executableStart = 0x3100UL,
+                    executableEnd = 0x4000UL,
+                    name = "libsecond.so",
+                    buildId = null,
+                ),
+            )
+    }
 
     @Test
     fun `rejects size checksum signal and timestamp mismatches`() {
