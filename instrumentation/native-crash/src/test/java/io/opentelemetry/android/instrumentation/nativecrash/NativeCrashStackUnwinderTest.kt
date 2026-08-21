@@ -49,6 +49,23 @@ class NativeCrashStackUnwinderTest {
     }
 
     @Test
+    fun `walks frame pointers when the program counter is zero`() {
+        val trace =
+            NativeCrashStackUnwinder.unwind(
+                snapshot(
+                    programCounter = 0UL,
+                    stack = stack(8, 0x7010UL, 0x1300UL, 0UL, 0x1500UL),
+                ),
+            )
+
+        assertThat(trace.frames)
+            .containsExactly(
+                frame(0x300UL, NativeCrashFrameSource.FRAME_POINTER),
+                frame(0x500UL, NativeCrashFrameSource.FRAME_POINTER),
+            )
+    }
+
+    @Test
     fun `uses the normalized arm link register when no frame pointer caller is available`() {
         val trace =
             NativeCrashStackUnwinder.unwind(
@@ -63,6 +80,21 @@ class NativeCrashStackUnwinderTest {
                 frame(0x120UL, NativeCrashFrameSource.PROGRAM_COUNTER),
                 frame(0x300UL, NativeCrashFrameSource.LINK_REGISTER),
             )
+    }
+
+    @Test
+    fun `uses the arm link register when the program counter is zero`() {
+        val trace =
+            NativeCrashStackUnwinder.unwind(
+                snapshot(
+                    architecture = NativeCrashArchitecture.ARM,
+                    programCounter = 0UL,
+                    linkRegister = 0x1301UL,
+                ),
+            )
+
+        assertThat(trace.frames)
+            .containsExactly(frame(0x300UL, NativeCrashFrameSource.LINK_REGISTER))
     }
 
     @Test
