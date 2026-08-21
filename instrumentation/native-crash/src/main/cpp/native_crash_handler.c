@@ -345,7 +345,7 @@ static bool capture_registers(
 #else
     return false;
 #endif
-    return snapshot->program_counter != 0 && snapshot->stack_pointer != 0;
+    return snapshot->stack_pointer != 0;
 }
 
 static uint32_t snapshot_checksum(const struct otel_native_crash_snapshot *snapshot) {
@@ -442,14 +442,16 @@ static void record_crash(int signal_number, void *user_context) {
         return;
     }
     uint64_t timestamp_epoch_nanos = seconds * NANOS_PER_SECOND + nanoseconds;
+    if (!write_crash_marker_at(
+            crash_record_path,
+            temporary_crash_record_path,
+            signal_number,
+            timestamp_epoch_nanos)) {
+        return;
+    }
     if (!write_crash_snapshot(signal_number, timestamp_epoch_nanos, user_context)) {
         unlink(crash_snapshot_path);
     }
-    (void) write_crash_marker_at(
-        crash_record_path,
-        temporary_crash_record_path,
-        signal_number,
-        timestamp_epoch_nanos);
 }
 
 static void rollback_installed_handlers(void) {
