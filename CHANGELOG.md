@@ -4,6 +4,11 @@
 
 ### 📈 Enhancements
 
+- Native crash events now include best-effort module-relative C/C++ frames captured with a bounded,
+  signal-safe snapshot and unwound after restart. Retryable recovery failures retain the pending
+  crash for the next launch.
+  ([#1940](https://github.com/open-telemetry/opentelemetry-android/issues/1940))
+
 - The Compose Navigation instrumentation, which shipped in 1.6.0 without emitting any telemetry,
   now records an `app.navigation.complete` event carrying the `app.navigation.destination.name`
   attribute whenever a navigation completes.

@@ -24,6 +24,12 @@ jobs:
         run: touch demo-app/local.properties
       - name: run gradle
         run: ./gradlew check koverXmlReport --stacktrace
+      - name: Build native crash library for every ABI
+        run: |
+          ./gradlew \
+            :instrumentation:native-crash:assembleDebug \
+            :instrumentation:native-crash:assembleRelease \
+            --stacktrace
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
@@ -62,14 +68,53 @@ jobs:
           api-level: 29
           script: ./gradlew connectedCheck --stacktrace
 
+  native-crash-instrumented-tests:
+    name: "native-crash-instrumented-tests (API ${{ matrix.api-level }}, ${{ matrix.arch }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api-level: 23
+            arch: x86
+          - api-level: 36
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up JDK for running Gradle
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Setup Gradle build action
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+      - name: touch local props
+        run: touch demo-app/local.properties
+      - name: Enable KVM for Android tests
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run native crash tests
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: ${{ matrix.arch }}
+          script: ./gradlew :instrumentation:native-crash:connectedDebugAndroidTest --stacktrace
+
   required-status-check:
     needs:
       - pr-checks
       - android-instrumented-tests
+      - native-crash-instrumented-tests
     runs-on: ubuntu-latest
     if: always()
     steps:
       - if: |
           needs.pr-checks.result != 'success' ||
-          needs.android-instrumented-tests.result != 'success'
+          needs.android-instrumented-tests.result != 'success' ||
+          needs.native-crash-instrumented-tests.result != 'success'
         run: exit 1
