@@ -20,14 +20,29 @@ You can customize session behavior using the configuration DSL:
 ```kotlin
 OpenTelemetryRumInitializer.initialize(context) {
     session {
-        // Session expires after 15 minutes in background (default)
-        backgroundInactivityTimeout = 15.minutes
+        // Session expires after 15 minutes without meaningful activity (default)
+        inactivityTimeout = 15.minutes
 
         // Session expires after 4 hours regardless of activity (default)
         maxLifetime = 4.hours
     }
 }
 ```
+
+Returning to the foreground records meaningful activity. The agent checks whether the current
+session has expired before it records that activity. Passive telemetry, including spans and logs,
+does not extend the inactivity window.
+
+Custom integrations can record other meaningful activity explicitly:
+
+```kotlin
+openTelemetryRum.sessionProvider.recordActivity()
+```
+
+With the agent's built-in provider, calling `getSessionId()` directly also records activity for
+compatibility with existing integrations. Telemetry processors should use
+`getSessionIdForAttribution()` when retrieving the ID must not extend the session. Custom providers
+that track inactivity should override `getSessionIdForAttribution()` and `recordActivity()`.
 
 If not using the agent, you can create a `SessionManager` directly with a custom `SessionConfig`.
 
