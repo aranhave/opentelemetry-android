@@ -29,9 +29,10 @@ OpenTelemetryRumInitializer.initialize(context) {
 }
 ```
 
-Returning to the foreground records meaningful activity. The agent checks whether the current
-session has expired before it records that activity. Passive telemetry, including spans and logs,
-does not extend the inactivity window.
+Returning to the foreground, pointer input, hardware key input, and mouse or trackpad scrolling
+record meaningful activity. The agent checks whether the current session has expired before it
+records that activity. Passive telemetry, including spans and logs, does not extend the inactivity
+window.
 
 Custom integrations can record other meaningful activity explicitly:
 

@@ -16,6 +16,7 @@ import io.opentelemetry.android.agent.connectivity.HttpEndpointConnectivity
 import io.opentelemetry.android.agent.dsl.OpenTelemetryConfiguration
 import io.opentelemetry.android.agent.session.SessionConfig
 import io.opentelemetry.android.agent.session.SessionIdTimeoutHandler
+import io.opentelemetry.android.agent.session.SessionInputActivityInstrumentation
 import io.opentelemetry.android.agent.session.SessionManager
 import io.opentelemetry.android.config.OtelRumConfig
 import io.opentelemetry.android.internal.services.Services
@@ -65,6 +66,7 @@ object OpenTelemetryRumInitializer {
 
                 val sessionManager = createSessionManager(Services.get(ctx).appLifecycle, cfg)
                 setSessionProvider(sessionManager)
+                addInstrumentation(SessionInputActivityInstrumentation(sessionManager::recordActivity))
                 setResource(
                     AndroidResource
                         .createDefault(ctx)
