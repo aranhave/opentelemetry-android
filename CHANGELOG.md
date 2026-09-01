@@ -21,9 +21,9 @@
   behavior by default.
   ([#910](https://github.com/open-telemetry/opentelemetry-android/issues/910))
 
-- Sessions now expire after 15 minutes without meaningful activity. Returning to the foreground or
-  calling `recordActivity()` refreshes the inactivity window, while passive telemetry does not. The
-  four-hour maximum lifetime remains unchanged.
+- Sessions now expire after 15 minutes without meaningful activity. Returning to the foreground,
+  touch, key, or scroll input, or calling `recordActivity()` refreshes the inactivity window, while
+  passive telemetry does not. The four-hour maximum lifetime remains unchanged.
   ([#794](https://github.com/open-telemetry/opentelemetry-android/issues/794),
   [#910](https://github.com/open-telemetry/opentelemetry-android/issues/910))
 
