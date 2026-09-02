@@ -4,6 +4,11 @@
 
 ### 📣 Migration notes
 
+- Foreground sessions now expire after the configured inactivity window; previously they remained
+  active until the four-hour maximum. Expired sessions rotate on the next access, including passive
+  telemetry attribution. Use `inactivityTimeout`; `backgroundInactivityTimeout` remains as a
+  deprecated alias.
+
 - Network change events now use `network.connection.type` instead of the deprecated
   `network.status`. To keep emitting `network.status` while migrating, configure
   `semanticConventions { useLatestExperimental = false }`.
@@ -15,6 +20,12 @@
   `recordActivity()` and `getSessionIdForAttribution()`. Existing providers retain their previous
   behavior by default.
   ([#910](https://github.com/open-telemetry/opentelemetry-android/issues/910))
+
+- Sessions now expire after 15 minutes without meaningful activity. Returning to the foreground or
+  calling `recordActivity()` refreshes the inactivity window, while passive telemetry does not. The
+  four-hour maximum lifetime remains unchanged.
+  ([#794](https://github.com/open-telemetry/opentelemetry-android/issues/794),
+  [#910](https://github.com/open-telemetry/opentelemetry-android/issues/910))
 
 - The Compose Navigation instrumentation, which shipped in 1.6.0 without emitting any telemetry,
   now records an `app.navigation.complete` event carrying the `app.navigation.destination.name`

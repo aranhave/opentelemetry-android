@@ -20,7 +20,6 @@ import io.opentelemetry.android.agent.session.SessionManager
 import io.opentelemetry.android.config.OtelRumConfig
 import io.opentelemetry.android.internal.services.Services
 import io.opentelemetry.android.internal.services.applifecycle.AppLifecycle
-import io.opentelemetry.android.session.SessionProvider
 import io.opentelemetry.exporter.otlp.http.logs.OtlpHttpLogRecordExporter
 import io.opentelemetry.exporter.otlp.http.metrics.OtlpHttpMetricExporter
 import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter
@@ -64,7 +63,8 @@ object OpenTelemetryRumInitializer {
                         instrumentationLoader = instrumentationLoader,
                     ).also(configuration)
 
-                setSessionProvider(createSessionProvider(Services.get(ctx).appLifecycle, cfg))
+                val sessionManager = createSessionManager(Services.get(ctx).appLifecycle, cfg)
+                setSessionProvider(sessionManager)
                 setResource(
                     AndroidResource
                         .createDefault(ctx)
@@ -144,19 +144,19 @@ object OpenTelemetryRumInitializer {
             else -> "none"
         }
 
-    private fun createSessionProvider(
+    private fun createSessionManager(
         appLifecycle: AppLifecycle,
         cfg: OpenTelemetryConfiguration,
-    ): SessionProvider {
+    ): SessionManager {
         val sessionConfig =
             SessionConfig(
-                cfg.sessionConfig.backgroundInactivityTimeout,
+                cfg.sessionConfig.inactivityTimeout,
                 cfg.sessionConfig.maxLifetime,
             )
         val clock = cfg.clock
         val timeoutHandler = SessionIdTimeoutHandler(sessionConfig, clock)
-        appLifecycle.registerListener(timeoutHandler)
         val sessionManager = SessionManager.create(timeoutHandler, sessionConfig, clock)
+        appLifecycle.registerListener(sessionManager)
         cfg.sessionConfig.getObservers().forEach { sessionManager.addObserver(it) }
         return sessionManager
     }

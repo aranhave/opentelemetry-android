@@ -16,10 +16,21 @@ import kotlin.time.Duration.Companion.minutes
 @OpenTelemetryDslMarker
 class SessionConfiguration internal constructor() {
     /**
-     * The maximum duration which a session can remain open in the background before it
+     * The maximum duration which a session can remain open without meaningful activity before it
      * automatically expires.
      */
-    var backgroundInactivityTimeout: Duration = 15.minutes
+    var inactivityTimeout: Duration = 15.minutes
+
+    /**
+     * The maximum duration which a session can remain open without meaningful activity before it
+     * automatically expires.
+     */
+    @Deprecated("Use inactivityTimeout", ReplaceWith("inactivityTimeout"))
+    var backgroundInactivityTimeout: Duration
+        get() = inactivityTimeout
+        set(value) {
+            inactivityTimeout = value
+        }
 
     /**
      * The maximum duration which a session can remain open before it automatically expires.
